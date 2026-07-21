@@ -1,0 +1,6 @@
+Third-party JavaScript bundled in this directory:
+
+- tex-svg.js — MathJax v3.2.2 (https://github.com/mathjax/MathJax), Apache License 2.0.
+  Used to render LaTeX formulas to SVG.
+- mermaid.min.js — Mermaid v9.4.3 (https://github.com/mermaid-js/mermaid), MIT License.
+  Used to render mermaid diagrams to SVG.

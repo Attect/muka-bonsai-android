@@ -1,0 +1,551 @@
+package app.muka.bonsai.ui
+
+import android.app.Application
+import android.content.Context
+import android.net.Uri
+import android.os.Debug
+import android.util.Log
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import app.muka.bonsai.llama.AiChat
+import app.muka.bonsai.llama.InferenceEngine
+import app.muka.bonsai.llama.InferenceParams
+import app.muka.bonsai.api.OpenAiServer
+import app.muka.bonsai.model.AVAILABLE_MODELS
+import app.muka.bonsai.model.BonsaiModel
+import app.muka.bonsai.model.DownloadSource
+import app.muka.bonsai.model.DownloadStatus
+import app.muka.bonsai.model.ModelManager
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+
+data class ChatMessage(
+    val role: Role,
+    val text: String,
+    val isGenerating: Boolean = false,
+) {
+    enum class Role { User, Assistant }
+}
+
+data class AppUiState(
+    val selectedTab: Screen = Screen.Chat,
+    val messages: List<ChatMessage> = emptyList(),
+    val inputText: String = "",
+    val isGenerating: Boolean = false,
+    val selectedModel: BonsaiModel = AVAILABLE_MODELS.first(),
+    val modelPath: String? = null,
+    val engineState: InferenceEngine.State = InferenceEngine.State.Uninitialized,
+    val errorMessage: String? = null,
+    val infoMessage: String? = null,
+    val params: InferenceParams = InferenceParams(),
+    val metrics: PerformanceMetrics = PerformanceMetrics(),
+    val localModels: List<File> = emptyList(),
+    val downloadStatuses: Map<String, DownloadStatus> = emptyMap(),
+    /** Model file absolute path -> max context length read from GGUF metadata. */
+    val modelContextLengths: Map<String, Int> = emptyMap(),
+    val apiServerRunning: Boolean = false,
+    val apiServerPort: Int = ChatViewModel.API_PORT,
+    val apiServerError: String? = null,
+    val downloadSource: DownloadSource = DownloadSource.Default,
+)
+
+enum class Screen { Chat, Models, Settings }
+
+class ChatViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val engine: InferenceEngine = AiChat.getInferenceEngine(application)
+    val modelManager = ModelManager(application)
+
+    /** Serializes inference between the chat UI and the OpenAI API server. */
+    private val inferenceMutex = Mutex()
+    private var apiServer: OpenAiServer? = null
+
+    private val _uiState = MutableStateFlow(AppUiState())
+    val uiState: StateFlow<AppUiState> = _uiState.asStateFlow()
+
+    private val prefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    init {
+        val savedSource = prefs.getString(KEY_DOWNLOAD_SOURCE, null)
+            ?.let { name -> DownloadSource.entries.firstOrNull { it.name == name } }
+            ?: DownloadSource.Default
+        _uiState.update { it.copy(downloadSource = savedSource) }
+        viewModelScope.launch {
+            engine.state.collect { state ->
+                _uiState.update { it.copy(engineState = state) }
+            }
+        }
+        viewModelScope.launch {
+            refreshLocalModels()
+            startMetricsUpdater()
+        }
+    }
+
+    fun selectTab(screen: Screen) {
+        _uiState.update { it.copy(selectedTab = screen) }
+    }
+
+    fun selectModel(model: BonsaiModel) {
+        _uiState.update { it.copy(selectedModel = model) }
+    }
+
+    fun updateParams(params: InferenceParams) {
+        _uiState.update { it.copy(params = params) }
+    }
+
+    fun loadSelectedModel() {
+        val model = _uiState.value.selectedModel
+        val file = modelManager.modelFile(model)
+        loadModel(file)
+    }
+
+    fun loadModel(file: File) {
+        viewModelScope.launch {
+            if (!file.exists()) {
+                _uiState.update { it.copy(errorMessage = "未找到模型文件：${file.name}") }
+                return@launch
+            }
+            performLoad(file)
+        }
+    }
+
+    fun loadModelFromUri(uri: Uri) {
+        viewModelScope.launch {
+            try {
+                _uiState.update { it.copy(errorMessage = null, infoMessage = "正在导入模型…") }
+                val dest = File(modelManager.modelsDir, "imported_${System.currentTimeMillis()}.gguf")
+                copyUriToFile(getApplication(), uri, dest)
+                performLoad(dest)
+                refreshLocalModels()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to import model", e)
+                _uiState.update { it.copy(errorMessage = e.message ?: "导入模型失败") }
+            }
+        }
+    }
+
+    fun reloadModel() {
+        viewModelScope.launch {
+            try {
+                val path = _uiState.value.modelPath
+                    ?: throw IllegalStateException("No model loaded")
+                _uiState.update { it.copy(infoMessage = "正在重新加载模型…") }
+                engine.cleanUp()
+                performLoad(File(path))
+                _uiState.update { it.copy(infoMessage = "模型已重新加载") }
+            } catch (e: Exception) {
+                Log.e(TAG, "Reload failed", e)
+                _uiState.update { it.copy(errorMessage = e.message ?: "重新加载失败") }
+            }
+        }
+    }
+
+    fun unloadModel() {
+        try {
+            engine.cleanUp()
+            _uiState.update { it.copy(modelPath = null, messages = emptyList()) }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to unload model", e)
+        }
+    }
+
+    fun onInputChange(text: String) {
+        _uiState.update { it.copy(inputText = text) }
+    }
+
+    fun sendMessage() {
+        val text = _uiState.value.inputText.trim()
+        if (text.isEmpty()) return
+        if (_uiState.value.isGenerating) return
+
+        _uiState.update {
+            it.copy(
+                inputText = "",
+                messages = it.messages + ChatMessage(ChatMessage.Role.User, text),
+                isGenerating = true,
+                metrics = PerformanceMetrics(),
+            )
+        }
+
+        viewModelScope.launch {
+            inferenceMutex.withLock {
+                try {
+                    val assistantMessage = ChatMessage(ChatMessage.Role.Assistant, "", isGenerating = true)
+                    _uiState.update { it.copy(messages = it.messages + assistantMessage) }
+
+                    val startTime = System.currentTimeMillis()
+                    val buffer = StringBuilder()
+                    var tokenCount = 0
+                    var promptTokenCount = 0
+
+                    engine.sendUserPrompt(text, predictLength = _uiState.value.params.maxTokens).collect { token ->
+                        buffer.append(token)
+                        tokenCount++
+                        if (promptTokenCount == 0) {
+                            promptTokenCount = estimatePromptTokens(text)
+                        }
+                        val elapsed = System.currentTimeMillis() - startTime
+                        val tps = if (elapsed > 0) tokenCount * 1000.0 / elapsed else 0.0
+                        _uiState.update { state ->
+                            state.copy(
+                                metrics = state.metrics.copy(
+                                    tokensGenerated = tokenCount,
+                                    promptTokens = promptTokenCount,
+                                    tokensPerSecond = tps,
+                                    totalDurationMs = elapsed,
+                                )
+                            )
+                        }
+                        updateLastAssistantMessage(buffer.toString(), isGenerating = true)
+                    }
+
+                    val elapsed = System.currentTimeMillis() - startTime
+                    updateLastAssistantMessage(buffer.toString(), isGenerating = false)
+                    _uiState.update { state ->
+                        state.copy(
+                            isGenerating = false,
+                            metrics = state.metrics.copy(
+                                tokensGenerated = tokenCount,
+                                totalDurationMs = elapsed,
+                            )
+                        )
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.e(TAG, "Generation failed", e)
+                    _uiState.update { it.copy(errorMessage = e.message ?: "生成失败", isGenerating = false) }
+                }
+            }
+        }
+    }
+
+    fun stopGeneration() {
+        try {
+            engine.stopGeneration()
+            _uiState.update { it.copy(isGenerating = false) }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to stop generation", e)
+        }
+    }
+
+    fun clearMessages() {
+        _uiState.update { it.copy(messages = emptyList()) }
+    }
+
+    fun clearError() {
+        _uiState.update { it.copy(errorMessage = null) }
+    }
+
+    fun clearInfo() {
+        _uiState.update { it.copy(infoMessage = null) }
+    }
+
+    fun downloadModel(model: BonsaiModel) {
+        viewModelScope.launch {
+            try {
+                val id = modelManager.enqueueDownload(model, _uiState.value.downloadSource)
+                modelManager.downloadStatus(model, id).collect { status ->
+                    _uiState.update { state ->
+                        state.copy(downloadStatuses = state.downloadStatuses + (model.id to status))
+                    }
+                    when (status.type) {
+                        // Progress is shown on the model card itself; pushing every
+                        // tick into infoMessage would spam the snackbar.
+                        DownloadStatus.Type.Downloaded -> {
+                            _uiState.update { it.copy(infoMessage = "${model.id} 已下载") }
+                            refreshLocalModels()
+                        }
+                        DownloadStatus.Type.Failed -> {
+                            _uiState.update { it.copy(errorMessage = status.reason) }
+                        }
+                        else -> {}
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Download failed", e)
+                _uiState.update { it.copy(errorMessage = e.message ?: "下载失败") }
+            }
+        }
+    }
+
+    fun setDownloadSource(source: DownloadSource) {
+        prefs.edit().putString(KEY_DOWNLOAD_SOURCE, source.name).apply()
+        _uiState.update { it.copy(downloadSource = source) }
+    }
+
+    fun deleteModel(model: BonsaiModel) {
+        viewModelScope.launch {
+            modelManager.deleteModel(model)
+            refreshLocalModels()
+            _uiState.update { it.copy(infoMessage = "${model.id} 已删除") }
+        }
+    }
+
+    fun deleteLocalFile(file: File) {
+        viewModelScope.launch {
+            file.delete()
+            refreshLocalModels()
+            _uiState.update { it.copy(infoMessage = "${file.name} 已删除") }
+        }
+    }
+
+    fun refreshLocalModels() {
+        viewModelScope.launch {
+            // Pick up downloads that completed while the app was not running.
+            modelManager.sweepStagingDownloads()
+            val locals = modelManager.scanLocalModels()
+            val statuses = mutableMapOf<String, DownloadStatus>()
+            AVAILABLE_MODELS.forEach { model ->
+                val file = modelManager.modelFile(model)
+                val exists = file.exists()
+                android.util.Log.i(TAG, "Model ${model.id}: path=${file.absolutePath}, exists=$exists")
+                if (exists) {
+                    statuses[model.id] = DownloadStatus.Downloaded(file)
+                }
+            }
+            // Read each model's max context length from its GGUF header (metadata only, fast).
+            val contextLengths = mutableMapOf<String, Int>()
+            locals.forEach { file ->
+                modelManager.readContextLength(file)?.let { contextLengths[file.absolutePath] = it }
+            }
+            // Keep in-progress / failed downloads; replace completed ones with fresh scan results.
+            val pruned = _uiState.value.downloadStatuses.filterValues {
+                it.type == DownloadStatus.Type.Downloading || it.type == DownloadStatus.Type.Failed
+            }
+            _uiState.update {
+                it.copy(
+                    localModels = locals,
+                    downloadStatuses = pruned + statuses,
+                    modelContextLengths = contextLengths,
+                )
+            }
+            android.util.Log.i(TAG, "refreshLocalModels done, statuses=${statuses.keys}, contextLengths=$contextLengths")
+        }
+    }
+
+    private fun autoLoadSingleModel() {
+        viewModelScope.launch {
+            val locals = modelManager.scanLocalModels()
+            if (locals.size == 1) {
+                val file = locals.first()
+                _uiState.update { it.copy(infoMessage = "正在自动加载 ${file.name}…") }
+                performLoad(file)
+            }
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        apiServer?.stop()
+        apiServer = null
+        engine.destroy()
+    }
+
+    // ------------------------------------------------------------------
+    // OpenAI-compatible API server
+    // ------------------------------------------------------------------
+
+    fun setApiServerEnabled(enabled: Boolean) {
+        if (enabled) {
+            if (apiServer != null) return
+            try {
+                val server = OpenAiServer(API_PORT, apiHandler)
+                server.start()
+                apiServer = server
+                _uiState.update {
+                    it.copy(
+                        apiServerRunning = true,
+                        apiServerError = null,
+                        infoMessage = "API 服务已启动，端口 $API_PORT"
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start API server", e)
+                _uiState.update {
+                    it.copy(apiServerRunning = false, apiServerError = e.message ?: "API 服务启动失败")
+                }
+            }
+        } else {
+            apiServer?.stop()
+            apiServer = null
+            _uiState.update { it.copy(apiServerRunning = false, apiServerError = null) }
+        }
+    }
+
+    private val apiHandler = object : OpenAiServer.Handler {
+        override fun listModelIds(): List<String> =
+            _uiState.value.localModels.map { it.name }
+
+        override fun loadedModelId(): String? =
+            _uiState.value.modelPath?.let { File(it).name }
+
+        override suspend fun chatCompletion(
+            messages: List<Pair<String, String>>,
+            maxTokens: Int,
+            onDelta: suspend (String) -> Unit,
+        ): OpenAiServer.CompletionResult {
+            if (_uiState.value.modelPath == null) throw OpenAiServer.NoModelLoadedException()
+            if (!inferenceMutex.tryLock()) throw OpenAiServer.ApiBusyException()
+            try {
+                val prompt = buildApiPrompt(messages)
+                val promptTokens = estimatePromptTokens(prompt)
+                val buffer = StringBuilder()
+                var tokenCount = 0
+                var clientGone = false
+                val startTime = System.currentTimeMillis()
+
+                _uiState.update { it.copy(isGenerating = true, metrics = PerformanceMetrics()) }
+                try {
+                    engine.sendUserPrompt(prompt, predictLength = maxTokens).collect { token ->
+                        buffer.append(token)
+                        tokenCount++
+                        val elapsed = System.currentTimeMillis() - startTime
+                        _uiState.update { state ->
+                            state.copy(
+                                metrics = state.metrics.copy(
+                                    tokensGenerated = tokenCount,
+                                    promptTokens = promptTokens,
+                                    tokensPerSecond = if (elapsed > 0) tokenCount * 1000.0 / elapsed else 0.0,
+                                    totalDurationMs = elapsed,
+                                )
+                            )
+                        }
+                        if (!clientGone) {
+                            try {
+                                onDelta(token)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                // API client disconnected: stop generating instead of
+                                // propagating (which would push the engine into Error state).
+                                Log.w(TAG, "API client disconnected: ${e.message}")
+                                clientGone = true
+                                engine.stopGeneration()
+                            }
+                        }
+                    }
+                } finally {
+                    _uiState.update { it.copy(isGenerating = false) }
+                }
+                if (clientGone) throw IOException("API client disconnected")
+                return OpenAiServer.CompletionResult(
+                    text = buffer.toString(),
+                    promptTokens = promptTokens,
+                    completionTokens = tokenCount,
+                )
+            } finally {
+                inferenceMutex.unlock()
+            }
+        }
+    }
+
+    private fun buildApiPrompt(messages: List<Pair<String, String>>): String {
+        if (messages.size == 1 && messages[0].first == "user") return messages[0].second
+        return messages.joinToString("\n") { (role, content) ->
+            when (role) {
+                "system" -> "System: $content"
+                "assistant" -> "Assistant: $content"
+                else -> "User: $content"
+            }
+        }
+    }
+
+    private suspend fun performLoad(file: File) {
+        try {
+            _uiState.update { it.copy(errorMessage = null, infoMessage = "正在加载 ${file.name}…") }
+            // Switching models: unload the currently loaded one first.
+            when (engine.state.value) {
+                is InferenceEngine.State.ModelReady, is InferenceEngine.State.Error -> engine.cleanUp()
+                else -> {}
+            }
+            // Clamp the context size to the model's own maximum (from GGUF metadata).
+            val maxCtx = modelManager.readContextLength(file)
+            var params = _uiState.value.params
+            if (maxCtx != null) {
+                _uiState.update {
+                    it.copy(modelContextLengths = it.modelContextLengths + (file.absolutePath to maxCtx))
+                }
+                if (params.contextSize > maxCtx) {
+                    params = params.copy(contextSize = maxCtx)
+                    _uiState.update {
+                        it.copy(params = params, infoMessage = "上下文长度已调整为模型上限 $maxCtx")
+                    }
+                }
+            }
+            engine.loadModel(file.absolutePath, params)
+            engine.setSystemPrompt(params.systemPrompt)
+            _uiState.update { it.copy(modelPath = file.absolutePath, infoMessage = "模型就绪") }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load model", e)
+            _uiState.update { it.copy(errorMessage = e.message ?: "加载模型失败") }
+        }
+    }
+
+    private fun updateLastAssistantMessage(text: String, isGenerating: Boolean) {
+        _uiState.update { state ->
+            val messages = state.messages.toMutableList()
+            if (messages.isNotEmpty()) {
+                val last = messages.last()
+                if (last.role == ChatMessage.Role.Assistant) {
+                    messages[messages.size - 1] = last.copy(text = text, isGenerating = isGenerating)
+                }
+            }
+            state.copy(messages = messages)
+        }
+    }
+
+    private fun startMetricsUpdater() {
+        viewModelScope.launch {
+            while (isActive) {
+                val memInfo = Debug.MemoryInfo()
+                Debug.getMemoryInfo(memInfo)
+                val nativeHeap = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()
+                _uiState.update { state ->
+                    state.copy(
+                        metrics = state.metrics.copy(
+                            nativeHeapMb = nativeHeap / 1024 / 1024,
+                            totalPssMb = memInfo.totalPss / 1024L,
+                        )
+                    )
+                }
+                delay(1000)
+            }
+        }
+    }
+
+    private fun estimatePromptTokens(text: String): Int {
+        // Very rough estimate: ~4 chars per token for CJK/English mix.
+        return (text.length / 3.5).toInt().coerceAtLeast(1)
+    }
+
+    companion object {
+        private const val TAG = "ChatViewModel"
+        const val API_PORT = 8000
+        private const val PREFS_NAME = "bonsai_settings"
+        private const val KEY_DOWNLOAD_SOURCE = "download_source"
+    }
+}
+
+private fun copyUriToFile(context: Context, uri: Uri, dest: File) {
+    context.contentResolver.openInputStream(uri)?.use { input ->
+        FileOutputStream(dest).use { output ->
+            input.copyTo(output)
+        }
+    } ?: throw IllegalStateException("Cannot open $uri")
+}
