@@ -16,6 +16,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Slider
@@ -33,6 +34,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import app.muka.bonsai.BuildConfig
 import app.muka.bonsai.llama.InferenceParams
 import app.muka.bonsai.llama.KvCacheType
 import app.muka.bonsai.model.DownloadSource
@@ -290,6 +292,17 @@ fun SettingsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
             enabled = uiState.modelPath != null
         ) {
             Text("卸载模型")
+        }
+
+        if (BuildConfig.DEBUG) {
+            Spacer(modifier = Modifier.height(24.dp))
+
+            OutlinedButton(
+                onClick = { viewModel.selectTab(Screen.Test) },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Mock 渲染测试")
+            }
         }
     }
 }

@@ -60,7 +60,7 @@ data class AppUiState(
     val downloadSource: DownloadSource = DownloadSource.Default,
 )
 
-enum class Screen { Chat, Models, Settings }
+enum class Screen { Chat, Models, Settings, Test }
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 

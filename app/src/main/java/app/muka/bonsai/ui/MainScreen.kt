@@ -82,6 +82,9 @@ fun MainScreen(viewModel: ChatViewModel = viewModel()) {
                 viewModel = viewModel,
                 modifier = Modifier.padding(padding)
             )
+            Screen.Test -> RenderTestPage(
+                modifier = Modifier.padding(padding)
+            )
         }
     }
 }
