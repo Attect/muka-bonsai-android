@@ -85,6 +85,14 @@ fun MainScreen(viewModel: ChatViewModel = viewModel()) {
             Screen.Test -> RenderTestPage(
                 modifier = Modifier.padding(padding)
             )
+            Screen.About -> AboutPage(
+                viewModel = viewModel,
+                modifier = Modifier.padding(padding)
+            )
+            Screen.Licenses -> LicensesPage(
+                viewModel = viewModel,
+                modifier = Modifier.padding(padding)
+            )
         }
     }
 }

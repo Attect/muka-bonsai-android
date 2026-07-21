@@ -294,8 +294,17 @@ fun SettingsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
             Text("卸载模型")
         }
 
+        Spacer(modifier = Modifier.height(24.dp))
+
+        OutlinedButton(
+            onClick = { viewModel.selectTab(Screen.About) },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("关于")
+        }
+
         if (BuildConfig.DEBUG) {
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(8.dp))
 
             OutlinedButton(
                 onClick = { viewModel.selectTab(Screen.Test) },
