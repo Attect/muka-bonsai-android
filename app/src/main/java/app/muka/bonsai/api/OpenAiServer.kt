@@ -41,6 +41,9 @@ class OpenAiServer(
         /**
          * Run a chat completion against the currently loaded model.
          *
+         * @param model the client-requested model ID, or null when the client
+         *              omitted it. The handler may load/switch to the matching
+         *              local model before generating.
          * @param messages (role, content) pairs in conversation order
          * @param maxTokens maximum number of tokens to generate; negative means
          *                  the client did not specify one — fall back to the
@@ -51,8 +54,10 @@ class OpenAiServer(
          * @param onDelta invoked with every generated token (used for SSE streaming)
          * @throws ApiBusyException when another generation is already running
          * @throws NoModelLoadedException when no model is loaded
+         * @throws ModelNotFoundException when [model] matches no local model
          */
         suspend fun chatCompletion(
+            model: String?,
             messages: List<Pair<String, String>>,
             maxTokens: Int,
             temperature: Double?,
@@ -72,6 +77,7 @@ class OpenAiServer(
 
     class ApiBusyException : Exception("Another generation is in progress")
     class NoModelLoadedException : Exception("No model is loaded")
+    class ModelNotFoundException(requestedId: String) : Exception("Model not found: $requestedId")
 
     @Volatile
     private var serverSocket: ServerSocket? = null
@@ -216,13 +222,16 @@ class OpenAiServer(
         val temperature = if (json.has("temperature")) json.optDouble("temperature") else null
         val topP = if (json.has("top_p")) json.optDouble("top_p") else null
         val seed = if (json.has("seed")) json.optInt("seed") else null
-        val model = json.optString("model").ifBlank { handler.loadedModelId() ?: "bonsai" }
+        // The requested model is passed to the handler (which may auto-switch to it);
+        // the response echoes it back, falling back to the loaded model when omitted.
+        val requestedModel = json.optString("model").takeIf { it.isNotBlank() }
+        val model = requestedModel ?: handler.loadedModelId() ?: "bonsai"
         val id = "chatcmpl-${System.currentTimeMillis()}"
         val created = System.currentTimeMillis() / 1000
 
         if (!stream) {
             try {
-                val result = handler.chatCompletion(messages, maxTokens, temperature, topP, seed) { }
+                val result = handler.chatCompletion(requestedModel, messages, maxTokens, temperature, topP, seed) { }
                 val resp = JSONObject()
                     .put("id", id)
                     .put("object", "chat.completion")
@@ -251,6 +260,8 @@ class OpenAiServer(
                 writeError(output, 429, e.message)
             } catch (e: NoModelLoadedException) {
                 writeError(output, 503, e.message)
+            } catch (e: ModelNotFoundException) {
+                writeError(output, 404, e.message)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -300,7 +311,7 @@ class OpenAiServer(
                     sentRole = true
                 }
             }
-            val result = handler.chatCompletion(messages, maxTokens, temperature, topP, seed) { token ->
+            val result = handler.chatCompletion(requestedModel, messages, maxTokens, temperature, topP, seed) { token ->
                 ensureRoleChunk()
                 sendChunk(JSONObject().put("content", token), null)
             }
@@ -313,6 +324,8 @@ class OpenAiServer(
             if (headersSent) sendErrorEvent(output, e.message) else writeError(output, 429, e.message)
         } catch (e: NoModelLoadedException) {
             if (headersSent) sendErrorEvent(output, e.message) else writeError(output, 503, e.message)
+        } catch (e: ModelNotFoundException) {
+            if (headersSent) sendErrorEvent(output, e.message) else writeError(output, 404, e.message)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

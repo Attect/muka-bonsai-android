@@ -64,6 +64,8 @@ data class AppUiState(
     val apiServerRunning: Boolean = false,
     val apiServerPort: Int = ChatViewModel.API_PORT,
     val apiServerError: String? = null,
+    /** Whether API requests auto-load the model named in their "model" field. */
+    val apiAutoSwitchModel: Boolean = true,
     val downloadSource: DownloadSource = DownloadSource.Default,
 )
 
@@ -102,7 +104,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 temperature = prefs.getFloat(KEY_TEMPERATURE, SamplingParams().temperature),
             ),
         )
-        _uiState.update { it.copy(downloadSource = savedSource, params = defaultParams) }
+        val apiAutoSwitchModel = prefs.getBoolean(KEY_API_AUTO_SWITCH_MODEL, true)
+        _uiState.update {
+            it.copy(
+                downloadSource = savedSource,
+                params = defaultParams,
+                apiAutoSwitchModel = apiAutoSwitchModel,
+            )
+        }
         val apiServerWasEnabled = prefs.getBoolean(KEY_API_SERVER_ENABLED, false)
         viewModelScope.launch {
             engine.state.collect { state ->
@@ -402,6 +411,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(downloadSource = source) }
     }
 
+    fun setApiAutoSwitchModel(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_API_AUTO_SWITCH_MODEL, enabled).apply()
+        _uiState.update { it.copy(apiAutoSwitchModel = enabled) }
+    }
+
     fun deleteModel(model: BonsaiModel) {
         viewModelScope.launch {
             modelManager.deleteModel(model)
@@ -510,6 +524,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.value.modelPath?.let { File(it).name }
 
         override suspend fun chatCompletion(
+            model: String?,
             messages: List<Pair<String, String>>,
             maxTokens: Int,
             temperature: Double?,
@@ -517,9 +532,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             seed: Int?,
             onDelta: suspend (String) -> Unit,
         ): OpenAiServer.CompletionResult {
-            if (_uiState.value.modelPath == null) throw OpenAiServer.NoModelLoadedException()
+            // Lock first: the model switch below also touches the engine, so it
+            // must be serialized against UI/chat generation just like inference.
             if (!inferenceMutex.tryLock()) throw OpenAiServer.ApiBusyException()
             try {
+                if (model != null && _uiState.value.apiAutoSwitchModel) {
+                    ensureApiModelLoaded(model)
+                }
+                if (_uiState.value.modelPath == null) throw OpenAiServer.NoModelLoadedException()
                 val prompt = buildApiPrompt(messages)
                 val promptTokens = estimatePromptTokens(prompt)
                 // Client omitted max_tokens: use the app's configured generation
@@ -580,6 +600,28 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             } finally {
                 inferenceMutex.unlock()
             }
+        }
+    }
+
+    /**
+     * Load the local GGUF whose file name matches the API-requested model id,
+     * unless it is already the loaded model. Matching is case-insensitive and
+     * also accepts the file name without its ".gguf" extension.
+     *
+     * Must be called with [inferenceMutex] held.
+     */
+    private suspend fun ensureApiModelLoaded(requested: String) {
+        fun File.matches(id: String) =
+            name.equals(id, ignoreCase = true) || nameWithoutExtension.equals(id, ignoreCase = true)
+
+        val current = _uiState.value.modelPath?.let { File(it) }
+        if (current != null && current.matches(requested)) return
+        val target = _uiState.value.localModels.firstOrNull { it.matches(requested) }
+            ?: throw OpenAiServer.ModelNotFoundException(requested)
+        performLoad(target)
+        // performLoad swallows load errors into errorMessage; verify the outcome.
+        if (_uiState.value.modelPath != target.absolutePath) {
+            throw IOException("模型加载失败：${_uiState.value.errorMessage ?: target.name}")
         }
     }
 
@@ -679,6 +721,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         private const val KEY_SYSTEM_PROMPT = "system_prompt"
         private const val KEY_KV_CACHE_TYPE = "kv_cache_type"
         private const val KEY_API_SERVER_ENABLED = "api_server_enabled"
+        private const val KEY_API_AUTO_SWITCH_MODEL = "api_auto_switch_model"
 
         /** Per-model profile JSON: KEY_PROFILE_PREFIX + model file name. */
         private const val KEY_PROFILE_PREFIX = "profile_"

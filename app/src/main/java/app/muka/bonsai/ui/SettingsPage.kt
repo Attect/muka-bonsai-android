@@ -360,7 +360,7 @@ fun SettingsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
                         )
                     } else {
                         Text(
-                            text = "开启后外部应用可通过 OpenAI 兼容接口调用（需先加载模型）",
+                            text = "开启后外部应用可通过 OpenAI 兼容接口调用（需先加载模型，或由请求自动切换）",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -377,6 +377,33 @@ fun SettingsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
                 Switch(
                     checked = uiState.apiServerRunning,
                     onCheckedChange = { viewModel.setApiServerEnabled(it) }
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "API 请求自动切换模型",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = if (uiState.apiAutoSwitchModel)
+                            "按请求中的 model 字段自动加载对应本地模型；无法匹配时返回 404"
+                        else
+                            "忽略请求中的 model 字段，始终使用当前加载的模型",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = uiState.apiAutoSwitchModel,
+                    onCheckedChange = { viewModel.setApiAutoSwitchModel(it) }
                 )
             }
         }
