@@ -122,6 +122,35 @@ static common_sampler *new_sampler(float temp) {
 }
 
 extern "C"
+JNIEXPORT void JNICALL
+Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_setSamplingParams(
+        JNIEnv * /*env*/,
+        jobject /*unused*/,
+        jfloat temp,
+        jint top_k,
+        jfloat top_p,
+        jfloat penalty_repeat,
+        jfloat penalty_freq,
+        jfloat penalty_present,
+        jint seed) {
+    common_params_sampling sparams;
+    sparams.temp = temp;
+    sparams.top_k = top_k;
+    sparams.top_p = top_p;
+    sparams.penalty_repeat = penalty_repeat;
+    sparams.penalty_freq = penalty_freq;
+    sparams.penalty_present = penalty_present;
+    sparams.seed = seed < 0 ? LLAMA_DEFAULT_SEED : (uint32_t) seed;
+
+    // Cheap to rebuild; lets sampling changes apply per-generation without
+    // reloading the model.
+    common_sampler_free(g_sampler);
+    g_sampler = common_sampler_init(g_model, sparams);
+    LOGi("%s: temp=%.2f top_k=%d top_p=%.2f rep=%.2f freq=%.2f pres=%.2f seed=%d",
+         __func__, temp, top_k, top_p, penalty_repeat, penalty_freq, penalty_present, seed);
+}
+
+extern "C"
 JNIEXPORT jint JNICALL
 Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_prepare(
         JNIEnv * /*env*/,
@@ -326,11 +355,16 @@ static int generated_token_count;
 static std::string cached_token_chars;
 static std::ostringstream assistant_ss;
 
+// Why the last generation stopped: 0 = still running / not started,
+// 1 = max_new_tokens limit, 2 = llama_decode failure, 3 = EOG sampled.
+static int last_stop_reason;
+
 static void reset_short_term_states() {
     max_new_tokens = 0;
     generated_token_count = 0;
     cached_token_chars.clear();
     assistant_ss.str("");
+    last_stop_reason = 0;
 }
 
 static int decode_tokens_in_batches(
@@ -520,6 +554,7 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_generateNextToken(
     // stays correct even when context shifting rewinds the position.
     if (generated_token_count >= max_new_tokens) {
         LOGw("%s: STOP: generated %d tokens (limit %d)", __func__, generated_token_count, max_new_tokens);
+        last_stop_reason = 1;
         return nullptr;
     }
 
@@ -531,7 +566,9 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_generateNextToken(
     common_batch_clear(g_batch);
     common_batch_add(g_batch, new_token_id, current_position, {0}, true);
     if (llama_decode(g_context, g_batch) != 0) {
-        LOGe("%s: llama_decode() failed for generated token", __func__);
+        LOGe("%s: llama_decode() failed for generated token %d at position %d (after %d tokens)",
+             __func__, new_token_id, current_position, generated_token_count);
+        last_stop_reason = 2;
         return nullptr;
     }
 
@@ -541,7 +578,13 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_generateNextToken(
 
     // Stop if next token is EOG
     if (llama_vocab_is_eog(llama_model_get_vocab(g_model), new_token_id)) {
-        LOGd("id: %d,\tIS EOG!\nSTOP.", new_token_id);
+        // Must stay at WARN: with NDEBUG the debug log is compiled out, making
+        // an EOG stop indistinguishable from a silent hang in release builds.
+        LOGw("%s: STOP: sampled EOG token %d `%s` after %d tokens",
+             __func__, new_token_id,
+             common_token_to_piece(g_context, new_token_id).c_str(),
+             generated_token_count);
+        last_stop_reason = 3;
         chat_add_and_format(ROLE_ASSISTANT, assistant_ss.str());
         return nullptr;
     }
@@ -563,6 +606,13 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_generateNextToken(
         result = env->NewStringUTF("");
     }
     return result;
+}
+
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_getLastStopReasonImpl(JNIEnv * /*unused*/, jobject /*unused*/) {
+    return last_stop_reason;
 }
 
 

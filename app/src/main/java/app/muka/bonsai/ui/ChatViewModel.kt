@@ -10,6 +10,8 @@ import androidx.lifecycle.viewModelScope
 import app.muka.bonsai.llama.AiChat
 import app.muka.bonsai.llama.InferenceEngine
 import app.muka.bonsai.llama.InferenceParams
+import app.muka.bonsai.llama.KvCacheType
+import app.muka.bonsai.llama.SamplingParams
 import app.muka.bonsai.api.OpenAiServer
 import app.muka.bonsai.model.AVAILABLE_MODELS
 import app.muka.bonsai.model.BonsaiModel
@@ -17,6 +19,7 @@ import app.muka.bonsai.model.DownloadSource
 import app.muka.bonsai.model.DownloadStatus
 import app.muka.bonsai.model.ModelManager
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -26,6 +29,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -45,6 +50,8 @@ data class AppUiState(
     val isGenerating: Boolean = false,
     val selectedModel: BonsaiModel = AVAILABLE_MODELS.first(),
     val modelPath: String? = null,
+    /** Profile being edited on the settings page when no model is loaded (file name). */
+    val profileFileName: String? = null,
     val engineState: InferenceEngine.State = InferenceEngine.State.Uninitialized,
     val errorMessage: String? = null,
     val infoMessage: String? = null,
@@ -76,17 +83,41 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val prefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+    /** Default profile: seeded from the legacy global keys (pre per-model profiles). */
+    private val defaultParams: InferenceParams
+
     init {
         val savedSource = prefs.getString(KEY_DOWNLOAD_SOURCE, null)
             ?.let { name -> DownloadSource.entries.firstOrNull { it.name == name } }
             ?: DownloadSource.Default
-        _uiState.update { it.copy(downloadSource = savedSource) }
+        defaultParams = InferenceParams(
+            contextSize = prefs.getInt(KEY_CONTEXT_SIZE, InferenceParams().contextSize),
+            maxTokens = prefs.getInt(KEY_MAX_TOKENS, InferenceParams().maxTokens),
+            threadCount = prefs.getInt(KEY_THREAD_COUNT, InferenceParams().threadCount),
+            systemPrompt = prefs.getString(KEY_SYSTEM_PROMPT, null) ?: InferenceParams().systemPrompt,
+            kvCacheType = prefs.getString(KEY_KV_CACHE_TYPE, null)
+                ?.let { name -> KvCacheType.entries.firstOrNull { it.name == name } }
+                ?: InferenceParams().kvCacheType,
+            sampling = SamplingParams(
+                temperature = prefs.getFloat(KEY_TEMPERATURE, SamplingParams().temperature),
+            ),
+        )
+        _uiState.update { it.copy(downloadSource = savedSource, params = defaultParams) }
+        val apiServerWasEnabled = prefs.getBoolean(KEY_API_SERVER_ENABLED, false)
         viewModelScope.launch {
             engine.state.collect { state ->
                 _uiState.update { it.copy(engineState = state) }
             }
         }
         viewModelScope.launch {
+            // Deferred to a worker dispatcher: Main.immediate would run this
+            // inline during construction, when apiHandler (declared further
+            // down the class body) is still null.
+            if (apiServerWasEnabled) {
+                withContext(Dispatchers.IO) {
+                    setApiServerEnabled(true)
+                }
+            }
             refreshLocalModels()
             startMetricsUpdater()
         }
@@ -97,11 +128,86 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun selectModel(model: BonsaiModel) {
-        _uiState.update { it.copy(selectedModel = model) }
+        // Without a loaded model, the settings page edits the selected model's
+        // profile; switch to it so it shows the right values.
+        val fileName = modelManager.modelFile(model).name
+        _uiState.update {
+            it.copy(
+                selectedModel = model,
+                profileFileName = fileName,
+                params = if (it.modelPath == null) loadProfile(fileName) else it.params,
+            )
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Per-model settings profiles, keyed by model file name
+    // ------------------------------------------------------------------
+
+    /** File name of the model the settings currently apply to, if any. */
+    private fun currentProfileFileName(): String? =
+        _uiState.value.modelPath?.let { File(it).name }
+            ?: _uiState.value.profileFileName
+            ?: _uiState.value.selectedModel?.let { modelManager.modelFile(it).name }
+
+    /** Choose which model's profile the settings page edits (no load required). */
+    fun selectProfile(fileName: String) {
+        _uiState.update {
+            it.copy(
+                profileFileName = fileName,
+                params = if (it.modelPath == null) loadProfile(fileName) else it.params,
+            )
+        }
+    }
+
+    private fun loadProfile(fileName: String): InferenceParams {
+        val json = prefs.getString(KEY_PROFILE_PREFIX + fileName, null) ?: return defaultParams
+        return try {
+            val o = JSONObject(json)
+            InferenceParams(
+                contextSize = o.optInt("contextSize", defaultParams.contextSize),
+                maxTokens = o.optInt("maxTokens", defaultParams.maxTokens),
+                threadCount = o.optInt("threadCount", defaultParams.threadCount),
+                systemPrompt = o.optString("systemPrompt", defaultParams.systemPrompt),
+                kvCacheType = o.optString("kvCacheType", "")
+                    .let { name -> KvCacheType.entries.firstOrNull { it.name == name } }
+                    ?: defaultParams.kvCacheType,
+                sampling = SamplingParams(
+                    temperature = o.optDouble("temperature", defaultParams.sampling.temperature.toDouble()).toFloat(),
+                    topK = o.optInt("topK", defaultParams.sampling.topK),
+                    topP = o.optDouble("topP", defaultParams.sampling.topP.toDouble()).toFloat(),
+                    repeatPenalty = o.optDouble("repeatPenalty", defaultParams.sampling.repeatPenalty.toDouble()).toFloat(),
+                    frequencyPenalty = o.optDouble("frequencyPenalty", defaultParams.sampling.frequencyPenalty.toDouble()).toFloat(),
+                    presencePenalty = o.optDouble("presencePenalty", defaultParams.sampling.presencePenalty.toDouble()).toFloat(),
+                    seed = o.optInt("seed", defaultParams.sampling.seed),
+                ),
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Corrupt profile for $fileName, using defaults", e)
+            defaultParams
+        }
+    }
+
+    private fun saveProfile(fileName: String, params: InferenceParams) {
+        val o = JSONObject()
+            .put("contextSize", params.contextSize)
+            .put("maxTokens", params.maxTokens)
+            .put("threadCount", params.threadCount)
+            .put("systemPrompt", params.systemPrompt)
+            .put("kvCacheType", params.kvCacheType.name)
+            .put("temperature", params.sampling.temperature.toDouble())
+            .put("topK", params.sampling.topK)
+            .put("topP", params.sampling.topP.toDouble())
+            .put("repeatPenalty", params.sampling.repeatPenalty.toDouble())
+            .put("frequencyPenalty", params.sampling.frequencyPenalty.toDouble())
+            .put("presencePenalty", params.sampling.presencePenalty.toDouble())
+            .put("seed", params.sampling.seed)
+        prefs.edit().putString(KEY_PROFILE_PREFIX + fileName, o.toString()).apply()
     }
 
     fun updateParams(params: InferenceParams) {
         _uiState.update { it.copy(params = params) }
+        currentProfileFileName()?.let { saveProfile(it, params) }
     }
 
     fun loadSelectedModel() {
@@ -191,7 +297,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     var tokenCount = 0
                     var promptTokenCount = 0
 
-                    engine.sendUserPrompt(text, predictLength = _uiState.value.params.maxTokens).collect { token ->
+                    engine.sendUserPrompt(
+                        text,
+                        predictLength = _uiState.value.params.maxTokens,
+                        sampling = _uiState.value.params.sampling,
+                    ).collect { token ->
                         buffer.append(token)
                         tokenCount++
                         if (promptTokenCount == 0) {
@@ -217,6 +327,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     _uiState.update { state ->
                         state.copy(
                             isGenerating = false,
+                            // Surface a length-limit stop, which otherwise looks
+                            // like the model gave up mid-answer.
+                            infoMessage = if (engine.getLastStopReason() == 1)
+                                "已达最大输出长度（${state.params.maxTokens} tokens），可在设置中调大"
+                            else state.infoMessage,
                             metrics = state.metrics.copy(
                                 tokensGenerated = tokenCount,
                                 totalDurationMs = elapsed,
@@ -360,6 +475,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // ------------------------------------------------------------------
 
     fun setApiServerEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_API_SERVER_ENABLED, enabled).apply()
         if (enabled) {
             if (apiServer != null) return
             try {
@@ -396,6 +512,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         override suspend fun chatCompletion(
             messages: List<Pair<String, String>>,
             maxTokens: Int,
+            temperature: Double?,
+            topP: Double?,
+            seed: Int?,
             onDelta: suspend (String) -> Unit,
         ): OpenAiServer.CompletionResult {
             if (_uiState.value.modelPath == null) throw OpenAiServer.NoModelLoadedException()
@@ -403,6 +522,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val prompt = buildApiPrompt(messages)
                 val promptTokens = estimatePromptTokens(prompt)
+                // Client omitted max_tokens: use the app's configured generation
+                // length rather than a hidden server-side cap.
+                val effectiveMaxTokens = if (maxTokens > 0) maxTokens else _uiState.value.params.maxTokens
+                // Request-level sampling overrides (OpenAI-compatible fields).
+                val profileSampling = _uiState.value.params.sampling
+                val sampling = profileSampling.copy(
+                    temperature = temperature?.toFloat() ?: profileSampling.temperature,
+                    topP = topP?.toFloat() ?: profileSampling.topP,
+                    seed = seed ?: profileSampling.seed,
+                )
                 val buffer = StringBuilder()
                 var tokenCount = 0
                 var clientGone = false
@@ -410,7 +539,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                 _uiState.update { it.copy(isGenerating = true, metrics = PerformanceMetrics()) }
                 try {
-                    engine.sendUserPrompt(prompt, predictLength = maxTokens).collect { token ->
+                    engine.sendUserPrompt(prompt, predictLength = effectiveMaxTokens, sampling = sampling).collect { token ->
                         buffer.append(token)
                         tokenCount++
                         val elapsed = System.currentTimeMillis() - startTime
@@ -446,6 +575,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     text = buffer.toString(),
                     promptTokens = promptTokens,
                     completionTokens = tokenCount,
+                    finishReason = if (engine.getLastStopReason() == 1) "length" else "stop",
                 )
             } finally {
                 inferenceMutex.unlock()
@@ -474,18 +604,21 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             // Clamp the context size to the model's own maximum (from GGUF metadata).
             val maxCtx = modelManager.readContextLength(file)
-            var params = _uiState.value.params
+            var params = loadProfile(file.name)
             if (maxCtx != null) {
                 _uiState.update {
                     it.copy(modelContextLengths = it.modelContextLengths + (file.absolutePath to maxCtx))
                 }
                 if (params.contextSize > maxCtx) {
                     params = params.copy(contextSize = maxCtx)
+                    saveProfile(file.name, params)
                     _uiState.update {
-                        it.copy(params = params, infoMessage = "上下文长度已调整为模型上限 $maxCtx")
+                        it.copy(infoMessage = "上下文长度已调整为模型上限 $maxCtx")
                     }
                 }
             }
+            // Settings page edits the loaded model's profile from now on.
+            _uiState.update { it.copy(params = params) }
             engine.loadModel(file.absolutePath, params)
             engine.setSystemPrompt(params.systemPrompt)
             _uiState.update { it.copy(modelPath = file.absolutePath, infoMessage = "模型就绪") }
@@ -539,6 +672,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         const val API_PORT = 8000
         private const val PREFS_NAME = "bonsai_settings"
         private const val KEY_DOWNLOAD_SOURCE = "download_source"
+        private const val KEY_CONTEXT_SIZE = "context_size"
+        private const val KEY_MAX_TOKENS = "max_tokens"
+        private const val KEY_TEMPERATURE = "temperature"
+        private const val KEY_THREAD_COUNT = "thread_count"
+        private const val KEY_SYSTEM_PROMPT = "system_prompt"
+        private const val KEY_KV_CACHE_TYPE = "kv_cache_type"
+        private const val KEY_API_SERVER_ENABLED = "api_server_enabled"
+
+        /** Per-model profile JSON: KEY_PROFILE_PREFIX + model file name. */
+        private const val KEY_PROFILE_PREFIX = "profile_"
     }
 }
 

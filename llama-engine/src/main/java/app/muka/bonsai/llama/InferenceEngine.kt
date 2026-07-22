@@ -27,8 +27,22 @@ interface InferenceEngine {
 
     /**
      * Sends a user prompt to the loaded model and returns a Flow of generated tokens.
+     *
+     * @param sampling sampling parameters for this generation; applied right
+     *                 before decoding starts, so changes take effect immediately
+     *                 without reloading the model
      */
-    fun sendUserPrompt(message: String, predictLength: Int = DEFAULT_PREDICT_LENGTH): Flow<String>
+    fun sendUserPrompt(
+        message: String,
+        predictLength: Int = DEFAULT_PREDICT_LENGTH,
+        sampling: SamplingParams = SamplingParams(),
+    ): Flow<String>
+
+    /**
+     * Why the last generation stopped: 0 = not started/cancelled,
+     * 1 = predict length limit, 2 = decode failure, 3 = model emitted EOG.
+     */
+    fun getLastStopReason(): Int
 
     /**
      * Runs a benchmark with the specified parameters.
@@ -93,16 +107,32 @@ enum class KvCacheType(val label: String) {
 }
 
 /**
+ * Sampling parameters for text generation. Applied per-generation (the native
+ * sampler is rebuilt for each request), so edits take effect immediately.
+ *
+ * @param seed RNG seed; negative means random
+ */
+data class SamplingParams(
+    val temperature: Float = 0.3f,
+    val topK: Int = 40,
+    val topP: Float = 0.95f,
+    val repeatPenalty: Float = 1.0f,
+    val frequencyPenalty: Float = 0.0f,
+    val presencePenalty: Float = 0.0f,
+    val seed: Int = -1,
+)
+
+/**
  * Runtime parameters for model loading and text generation.
  */
 data class InferenceParams(
     val contextSize: Int = 8192,
     val maxTokens: Int = 2048,
-    val temperature: Float = 0.3f,
     // Default to the number of hardware threads (Snapdragon 8 Elite: 8).
     val threadCount: Int = Runtime.getRuntime().availableProcessors(),
     val systemPrompt: String = "你是 Bonsai，一位乐于助人的本地设备助手。",
     val kvCacheType: KvCacheType = KvCacheType.F16,
+    val sampling: SamplingParams = SamplingParams(),
 )
 
 val State.isUninterruptible

@@ -4,6 +4,8 @@ import android.content.Context
 import android.util.Log
 import app.muka.bonsai.llama.InferenceEngine
 import app.muka.bonsai.llama.InferenceParams
+import app.muka.bonsai.llama.KvCacheType
+import app.muka.bonsai.llama.SamplingParams
 import app.muka.bonsai.llama.UnsupportedArchitectureException
 import app.muka.bonsai.llama.internal.InferenceEngineImpl.Companion.getInstance
 import kotlinx.coroutines.CancellationException
@@ -95,6 +97,18 @@ internal class InferenceEngineImpl private constructor(
 
     private external fun generateNextToken(): String?
 
+    private external fun getLastStopReasonImpl(): Int
+
+    private external fun setSamplingParams(
+        temp: Float,
+        topK: Int,
+        topP: Float,
+        penaltyRepeat: Float,
+        penaltyFreq: Float,
+        penaltyPresent: Float,
+        seed: Int,
+    )
+
     private external fun unload()
 
     private external fun shutdown()
@@ -163,7 +177,7 @@ internal class InferenceEngineImpl private constructor(
                 prepare(
                     params.contextSize,
                     params.threadCount,
-                    params.temperature,
+                    params.sampling.temperature,
                     params.kvCacheType.ordinal,
                 ).let {
                     if (it != 0) throw IOException("Failed to prepare resources")
@@ -216,6 +230,7 @@ internal class InferenceEngineImpl private constructor(
     override fun sendUserPrompt(
         message: String,
         predictLength: Int,
+        sampling: SamplingParams,
     ): Flow<String> = flow {
         require(message.isNotEmpty()) { "User prompt discarded due to being empty!" }
         check(_state.value is InferenceEngine.State.ModelReady) {
@@ -227,6 +242,16 @@ internal class InferenceEngineImpl private constructor(
             _readyForSystemPrompt = false
             _cancelGeneration = false
             _state.value = InferenceEngine.State.ProcessingUserPrompt
+
+            setSamplingParams(
+                sampling.temperature,
+                sampling.topK,
+                sampling.topP,
+                sampling.repeatPenalty,
+                sampling.frequencyPenalty,
+                sampling.presencePenalty,
+                sampling.seed,
+            )
 
             processUserPrompt(message, predictLength).let { result ->
                 if (result != 0) {
@@ -282,6 +307,8 @@ internal class InferenceEngineImpl private constructor(
         _cancelGeneration = true
         Log.i(TAG, "Generation cancel requested")
     }
+
+    override fun getLastStopReason(): Int = getLastStopReasonImpl()
 
     /**
      * Unloads the model and frees resources, or reset error states

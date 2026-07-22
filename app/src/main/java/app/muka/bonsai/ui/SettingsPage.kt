@@ -15,6 +15,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -25,8 +27,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -49,12 +49,11 @@ fun SettingsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
         ?.let { uiState.modelContextLengths[it] }
         ?: 32768).coerceAtLeast(2048)
 
-    var contextSize by remember { mutableIntStateOf(params.contextSize) }
-    var maxTokens by remember { mutableIntStateOf(params.maxTokens) }
-    var threadCount by remember { mutableIntStateOf(params.threadCount) }
-    var temperature by remember { mutableFloatStateOf(params.temperature) }
-    var systemPrompt by remember { mutableStateOf(params.systemPrompt) }
-    var kvCacheType by remember { mutableStateOf(params.kvCacheType) }
+    // Which model's profile is being edited: the loaded model wins, otherwise
+    // the profile chosen in the selector below, otherwise the selected model.
+    val profileTarget = uiState.modelPath?.let { java.io.File(it).name }
+        ?: uiState.profileFileName
+        ?: uiState.selectedModel?.let { viewModel.modelManager.modelFile(it).name }
 
     Column(
         modifier = modifier
@@ -70,53 +69,168 @@ fun SettingsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        SettingCard(title = "上下文长度") {
-            val safeContextSize = contextSize.coerceIn(2048, maxContext)
-            IntSlider(
-                value = safeContextSize,
-                onValueChange = { contextSize = it },
-                range = 2048..maxContext,
-                step = 2048,
-                label = "$safeContextSize tokens（当前模型上限：$maxContext）"
-            )
+        SettingCard(title = "目标模型") {
+            var expanded by remember { mutableStateOf(false) }
+            Column {
+                OutlinedButton(
+                    onClick = { expanded = true },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = profileTarget ?: "选择要配置的模型…",
+                        color = if (profileTarget != null) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                DropdownMenu(
+                    expanded = expanded,
+                    onDismissRequest = { expanded = false }
+                ) {
+                    uiState.localModels.forEach { file ->
+                        DropdownMenuItem(
+                            text = { Text(file.name) },
+                            onClick = {
+                                viewModel.selectProfile(file.name)
+                                expanded = false
+                            }
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = when {
+                        uiState.modelPath != null -> "已加载该模型；以下设置为它独立保存"
+                        profileTarget != null -> "模型未加载；以下设置将在加载它时生效"
+                        else -> "选择的模型与配置一一绑定，随切换自动切换"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
 
         Spacer(modifier = Modifier.height(12.dp))
+
+        SectionHeader("生成参数（即时生效）")
 
         SettingCard(title = "最大输出长度") {
             IntSlider(
-                value = maxTokens,
-                onValueChange = { maxTokens = it },
+                value = params.maxTokens,
+                onValueChange = { viewModel.updateParams(params.copy(maxTokens = it)) },
                 range = 64..32768,
                 step = 256,
-                label = "$maxTokens tokens"
-            )
-        }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        SettingCard(title = "推理线程数") {
-            val maxThreads = remember { Runtime.getRuntime().availableProcessors() }
-            val safeThreadCount = threadCount.coerceIn(1, maxThreads)
-            IntSlider(
-                value = safeThreadCount,
-                onValueChange = { threadCount = it },
-                range = 1..maxThreads,
-                step = 1,
-                label = "$safeThreadCount 线程（处理器线程数：$maxThreads）"
+                label = "${params.maxTokens} tokens",
+                enabled = profileTarget != null
             )
         }
 
         Spacer(modifier = Modifier.height(12.dp))
 
         SettingCard(title = "温度 (Temperature)") {
-            Text(text = String.format("%.2f", temperature))
-            Slider(
-                value = temperature,
-                onValueChange = { temperature = it },
+            FloatSlider(
+                value = params.sampling.temperature,
+                onValueChange = { viewModel.updateParams(params.copy(sampling = params.sampling.copy(temperature = it))) },
                 valueRange = 0.0f..1.5f,
-                steps = 14,
-                modifier = Modifier.fillMaxWidth()
+                label = String.format("%.2f", params.sampling.temperature),
+                enabled = profileTarget != null
+            )
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        SettingCard(title = "Top-K / Top-P") {
+            IntSlider(
+                value = params.sampling.topK,
+                onValueChange = { viewModel.updateParams(params.copy(sampling = params.sampling.copy(topK = it))) },
+                range = 1..200,
+                step = 1,
+                label = "top_k = ${params.sampling.topK}",
+                enabled = profileTarget != null
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            FloatSlider(
+                value = params.sampling.topP,
+                onValueChange = { viewModel.updateParams(params.copy(sampling = params.sampling.copy(topP = it))) },
+                valueRange = 0.0f..1.0f,
+                label = String.format("top_p = %.2f", params.sampling.topP),
+                enabled = profileTarget != null
+            )
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        SettingCard(title = "惩罚") {
+            FloatSlider(
+                value = params.sampling.repeatPenalty,
+                onValueChange = { viewModel.updateParams(params.copy(sampling = params.sampling.copy(repeatPenalty = it))) },
+                valueRange = 0.5f..2.0f,
+                label = String.format("重复惩罚 = %.2f（1.0 关闭）", params.sampling.repeatPenalty),
+                enabled = profileTarget != null
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            FloatSlider(
+                value = params.sampling.frequencyPenalty,
+                onValueChange = { viewModel.updateParams(params.copy(sampling = params.sampling.copy(frequencyPenalty = it))) },
+                valueRange = 0.0f..2.0f,
+                label = String.format("频率惩罚 = %.2f（0 关闭）", params.sampling.frequencyPenalty),
+                enabled = profileTarget != null
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            FloatSlider(
+                value = params.sampling.presencePenalty,
+                onValueChange = { viewModel.updateParams(params.copy(sampling = params.sampling.copy(presencePenalty = it))) },
+                valueRange = 0.0f..2.0f,
+                label = String.format("存在惩罚 = %.2f（0 关闭）", params.sampling.presencePenalty),
+                enabled = profileTarget != null
+            )
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        SettingCard(title = "种子 (Seed)") {
+            OutlinedTextField(
+                value = params.sampling.seed.toString(),
+                onValueChange = { text ->
+                    text.toIntOrNull()?.let { seed ->
+                        viewModel.updateParams(params.copy(sampling = params.sampling.copy(seed = seed)))
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("-1 = 随机；固定值可复现输出") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                singleLine = true,
+                enabled = profileTarget != null
+            )
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        SectionHeader("加载参数（重新加载模型后生效）")
+
+        SettingCard(title = "上下文长度") {
+            val safeContextSize = params.contextSize.coerceIn(2048, maxContext)
+            IntSlider(
+                value = safeContextSize,
+                onValueChange = { viewModel.updateParams(params.copy(contextSize = it)) },
+                range = 2048..maxContext,
+                step = 2048,
+                label = "$safeContextSize tokens（当前模型上限：$maxContext）",
+                enabled = profileTarget != null
+            )
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        SettingCard(title = "推理线程数") {
+            val maxThreads = Runtime.getRuntime().availableProcessors()
+            val safeThreadCount = params.threadCount.coerceIn(1, maxThreads)
+            IntSlider(
+                value = safeThreadCount,
+                onValueChange = { viewModel.updateParams(params.copy(threadCount = it)) },
+                range = 1..maxThreads,
+                step = 1,
+                label = "$safeThreadCount 线程（处理器线程数：$maxThreads）",
+                enabled = profileTarget != null
             )
         }
 
@@ -128,14 +242,16 @@ fun SettingsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
                     modifier = Modifier
                         .fillMaxWidth()
                         .selectable(
-                            selected = kvCacheType == type,
-                            onClick = { kvCacheType = type }
+                            selected = params.kvCacheType == type,
+                            onClick = { viewModel.updateParams(params.copy(kvCacheType = type)) },
+                            enabled = profileTarget != null
                         ),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     RadioButton(
-                        selected = kvCacheType == type,
-                        onClick = { kvCacheType = type }
+                        selected = params.kvCacheType == type,
+                        onClick = { viewModel.updateParams(params.copy(kvCacheType = type)) },
+                        enabled = profileTarget != null
                     )
                     Text(
                         text = type.label,
@@ -144,7 +260,7 @@ fun SettingsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
                 }
             }
             Text(
-                text = "量化可显著减少 KV 缓存内存（Q4 约为 1/4），长上下文收益更大；需重新加载模型后生效",
+                text = "量化可显著减少 KV 缓存内存（Q4 约为 1/4），长上下文收益更大",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -154,16 +270,39 @@ fun SettingsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
 
         SettingCard(title = "系统提示词") {
             OutlinedTextField(
-                value = systemPrompt,
-                onValueChange = { systemPrompt = it },
+                value = params.systemPrompt,
+                onValueChange = { viewModel.updateParams(params.copy(systemPrompt = it)) },
                 modifier = Modifier.fillMaxWidth(),
                 label = { Text("系统提示词") },
                 minLines = 3,
-                maxLines = 6
+                maxLines = 6,
+                enabled = profileTarget != null
             )
         }
 
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Button(
+            onClick = { viewModel.reloadModel() },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = uiState.modelPath != null
+        ) {
+            Text("重新加载模型以应用加载参数")
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Button(
+            onClick = { viewModel.unloadModel() },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = uiState.modelPath != null
+        ) {
+            Text("卸载模型")
+        }
+
         Spacer(modifier = Modifier.height(12.dp))
+
+        SectionHeader("全局")
 
         SettingCard(title = "下载源") {
             DownloadSource.entries.forEach { source ->
@@ -244,58 +383,6 @@ fun SettingsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        Button(
-            onClick = {
-                viewModel.updateParams(
-                    InferenceParams(
-                        contextSize = contextSize.coerceIn(2048, maxContext),
-                        maxTokens = maxTokens,
-                        temperature = temperature,
-                        threadCount = threadCount,
-                        systemPrompt = systemPrompt,
-                        kvCacheType = kvCacheType
-                    )
-                )
-            },
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("保存设置")
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        Button(
-            onClick = {
-                viewModel.updateParams(
-                    InferenceParams(
-                        contextSize = contextSize.coerceIn(2048, maxContext),
-                        maxTokens = maxTokens,
-                        temperature = temperature,
-                        threadCount = threadCount,
-                        systemPrompt = systemPrompt,
-                        kvCacheType = kvCacheType
-                    )
-                )
-                viewModel.reloadModel()
-            },
-            modifier = Modifier.fillMaxWidth(),
-            enabled = uiState.modelPath != null
-        ) {
-            Text("应用设置并重新加载模型")
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        Button(
-            onClick = { viewModel.unloadModel() },
-            modifier = Modifier.fillMaxWidth(),
-            enabled = uiState.modelPath != null
-        ) {
-            Text("卸载模型")
-        }
-
-        Spacer(modifier = Modifier.height(24.dp))
-
         OutlinedButton(
             onClick = { viewModel.selectTab(Screen.About) },
             modifier = Modifier.fillMaxWidth()
@@ -314,6 +401,16 @@ fun SettingsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
             }
         }
     }
+}
+
+@Composable
+private fun SectionHeader(title: String) {
+    Text(
+        text = title,
+        style = MaterialTheme.typography.titleSmall,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(vertical = 4.dp)
+    )
 }
 
 @Composable
@@ -343,7 +440,8 @@ private fun IntSlider(
     onValueChange: (Int) -> Unit,
     range: IntRange,
     step: Int,
-    label: String
+    label: String,
+    enabled: Boolean = true
 ) {
     val stepsCount = ((range.last - range.first) / step) - 1
     Slider(
@@ -351,7 +449,26 @@ private fun IntSlider(
         onValueChange = { onValueChange(it.toInt()) },
         valueRange = range.first.toFloat()..range.last.toFloat(),
         steps = stepsCount.coerceAtLeast(0),
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier.fillMaxWidth(),
+        enabled = enabled
+    )
+    Text(text = label, style = MaterialTheme.typography.bodySmall)
+}
+
+@Composable
+private fun FloatSlider(
+    value: Float,
+    onValueChange: (Float) -> Unit,
+    valueRange: ClosedFloatingPointRange<Float>,
+    label: String,
+    enabled: Boolean = true
+) {
+    Slider(
+        value = value,
+        onValueChange = onValueChange,
+        valueRange = valueRange,
+        modifier = Modifier.fillMaxWidth(),
+        enabled = enabled
     )
     Text(text = label, style = MaterialTheme.typography.bodySmall)
 }

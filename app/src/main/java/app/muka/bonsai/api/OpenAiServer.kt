@@ -42,7 +42,12 @@ class OpenAiServer(
          * Run a chat completion against the currently loaded model.
          *
          * @param messages (role, content) pairs in conversation order
-         * @param maxTokens maximum number of tokens to generate
+         * @param maxTokens maximum number of tokens to generate; negative means
+         *                  the client did not specify one — fall back to the
+         *                  app's configured generation length
+         * @param temperature request-level override, null when not specified
+         * @param topP request-level override, null when not specified
+         * @param seed request-level override, null when not specified
          * @param onDelta invoked with every generated token (used for SSE streaming)
          * @throws ApiBusyException when another generation is already running
          * @throws NoModelLoadedException when no model is loaded
@@ -50,6 +55,9 @@ class OpenAiServer(
         suspend fun chatCompletion(
             messages: List<Pair<String, String>>,
             maxTokens: Int,
+            temperature: Double?,
+            topP: Double?,
+            seed: Int?,
             onDelta: suspend (String) -> Unit,
         ): CompletionResult
     }
@@ -58,6 +66,8 @@ class OpenAiServer(
         val text: String,
         val promptTokens: Int,
         val completionTokens: Int,
+        /** OpenAI-style finish reason: "stop" (EOG) or "length" (token limit). */
+        val finishReason: String,
     )
 
     class ApiBusyException : Exception("Another generation is in progress")
@@ -198,15 +208,21 @@ class OpenAiServer(
             m.optString("role", "user") to m.optString("content", "")
         }
         val stream = json.optBoolean("stream", false)
-        val maxTokensRaw = json.optInt("max_tokens", -1)
-        val maxTokens = if (maxTokensRaw > 0) maxTokensRaw else DEFAULT_MAX_TOKENS
+        // Negative when the client omitted max_tokens: the handler then falls
+        // back to the app's configured generation length instead of imposing
+        // a hidden cap of its own.
+        val maxTokens = json.optInt("max_tokens", -1)
+        // Optional OpenAI-compatible sampling overrides.
+        val temperature = if (json.has("temperature")) json.optDouble("temperature") else null
+        val topP = if (json.has("top_p")) json.optDouble("top_p") else null
+        val seed = if (json.has("seed")) json.optInt("seed") else null
         val model = json.optString("model").ifBlank { handler.loadedModelId() ?: "bonsai" }
         val id = "chatcmpl-${System.currentTimeMillis()}"
         val created = System.currentTimeMillis() / 1000
 
         if (!stream) {
             try {
-                val result = handler.chatCompletion(messages, maxTokens) { }
+                val result = handler.chatCompletion(messages, maxTokens, temperature, topP, seed) { }
                 val resp = JSONObject()
                     .put("id", id)
                     .put("object", "chat.completion")
@@ -221,7 +237,7 @@ class OpenAiServer(
                                         .put("role", "assistant")
                                         .put("content", result.text)
                                 )
-                                .put("finish_reason", "stop")
+                                .put("finish_reason", result.finishReason)
                         )
                     )
                     .put(
@@ -284,12 +300,12 @@ class OpenAiServer(
                     sentRole = true
                 }
             }
-            handler.chatCompletion(messages, maxTokens) { token ->
+            val result = handler.chatCompletion(messages, maxTokens, temperature, topP, seed) { token ->
                 ensureRoleChunk()
                 sendChunk(JSONObject().put("content", token), null)
             }
             ensureRoleChunk()
-            sendChunk(JSONObject(), "stop")
+            sendChunk(JSONObject(), result.finishReason)
             ensureSseHeaders()
             writeRaw(output, "data: [DONE]\n\n")
             output.flush()
@@ -372,7 +388,6 @@ class OpenAiServer(
     companion object {
         private const val TAG = "OpenAiServer"
         private const val MAX_BODY_BYTES = 1 * 1024 * 1024
-        private const val DEFAULT_MAX_TOKENS = 512
 
         /** Non-loopback IPv4 addresses of this device, for displaying the API endpoint. */
         fun localIpAddresses(): List<String> = runCatching {
