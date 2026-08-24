@@ -31,6 +31,10 @@ enum class DownloadSource(val label: String) {
  * @property repo Hugging Face repo, e.g. "prism-ml/Bonsai-27B-gguf"
  * @property filename GGUF filename inside the repo
  * @property footprint Approximate on-disk size in GiB
+ * @property mmprojFilename Optional vision projector (mmproj) inside the same
+ *                           repo. When set, [ModelManager] downloads it together
+ *                           with the model so image input works out of the box.
+ * @property mmprojFootprintGiB Approximate on-disk size of the mmproj in GiB
  */
 data class BonsaiModel(
     val family: String,
@@ -38,11 +42,17 @@ data class BonsaiModel(
     val repo: String,
     val filename: String,
     val footprintGiB: Double,
+    val mmprojFilename: String? = null,
+    val mmprojFootprintGiB: Double? = null,
 ) {
     val id: String = "$family-$sizeParam"
 
     /** Direct download URL for the single GGUF file via [source]. */
     fun downloadUrl(source: DownloadSource): String = source.urlFor(repo, filename)
+
+    /** Direct download URL for the mmproj file via [source], if configured. */
+    fun mmprojDownloadUrl(source: DownloadSource): String? =
+        mmprojFilename?.let { source.urlFor(repo, it) }
 }
 
 val AVAILABLE_MODELS = listOf(
@@ -52,6 +62,8 @@ val AVAILABLE_MODELS = listOf(
         repo = "prism-ml/Bonsai-27B-gguf",
         filename = "Bonsai-27B-Q1_0.gguf",
         footprintGiB = 3.9,
+        mmprojFilename = "Bonsai-27B-mmproj-Q8_0.gguf",
+        mmprojFootprintGiB = 0.59,
     ),
     BonsaiModel(
         family = "Ternary 1.58-bit",
@@ -59,6 +71,8 @@ val AVAILABLE_MODELS = listOf(
         repo = "prism-ml/Ternary-Bonsai-27B-gguf",
         filename = "Ternary-Bonsai-27B-Q2_0.gguf",
         footprintGiB = 5.9,
+        mmprojFilename = "Ternary-Bonsai-27B-mmproj-Q8_0.gguf",
+        mmprojFootprintGiB = 0.59,
     ),
     BonsaiModel(
         family = "Bonsai 1-bit",

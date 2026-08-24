@@ -83,7 +83,7 @@ internal class InferenceEngineImpl private constructor(
      */
     private external fun init(nativeLibDir: String)
 
-    private external fun load(modelPath: String): Int
+    private external fun load(modelPath: String, mmprojPath: String): Int
 
     private external fun prepare(nCtx: Int, nThreads: Int, temperature: Float, kvType: Int): Int
 
@@ -94,6 +94,10 @@ internal class InferenceEngineImpl private constructor(
     private external fun processSystemPrompt(systemPrompt: String): Int
 
     private external fun processUserPrompt(userPrompt: String, predictLength: Int): Int
+
+    private external fun processUserPromptMtmd(userPrompt: String, imagePaths: Array<String>, predictLength: Int): Int
+
+    private external fun isVisionEnabled(): Boolean
 
     private external fun generateNextToken(): String?
 
@@ -116,6 +120,10 @@ internal class InferenceEngineImpl private constructor(
     private val _state =
         MutableStateFlow<InferenceEngine.State>(InferenceEngine.State.Uninitialized)
     override val state: StateFlow<InferenceEngine.State> = _state.asStateFlow()
+
+    @Volatile
+    override var isMultimodal: Boolean = false
+        private set
 
     private var _readyForSystemPrompt = false
     @Volatile
@@ -151,10 +159,12 @@ internal class InferenceEngineImpl private constructor(
     private var _currentParams: InferenceParams = InferenceParams()
     private var _currentModelPath: String? = null
 
+    private var _mmprojLoaded = false
+
     /**
      * Load the LLM
      */
-    override suspend fun loadModel(pathToModel: String, params: InferenceParams) =
+    override suspend fun loadModel(pathToModel: String, params: InferenceParams, mmprojPath: String?) =
         withContext(llamaDispatcher) {
             check(_state.value is InferenceEngine.State.Initialized) {
                 "Cannot load model in ${_state.value.javaClass.simpleName}!"
@@ -167,12 +177,29 @@ internal class InferenceEngineImpl private constructor(
                     require(it.isFile) { "Not a valid file" }
                     require(it.canRead()) { "Cannot read file" }
                 }
+                if (mmprojPath != null) {
+                    File(mmprojPath).let {
+                        require(it.exists()) { "mmproj file not found" }
+                        require(it.isFile) { "Not a valid mmproj file" }
+                        require(it.canRead()) { "Cannot read mmproj file" }
+                    }
+                }
 
-                Log.i(TAG, "Loading model... \n$pathToModel")
+                Log.i(TAG, "Loading model... \n$pathToModel\nmmproj=$mmprojPath")
                 _readyForSystemPrompt = false
                 _state.value = InferenceEngine.State.LoadingModel
-                load(pathToModel).let {
-                    if (it != 0) throw UnsupportedArchitectureException()
+                load(pathToModel, mmprojPath ?: "").let {
+                    when (it) {
+                        0 -> {}
+                        2 -> throw IllegalArgumentException("mmproj 加载失败，请检查文件是否与模型匹配")
+                        else -> throw UnsupportedArchitectureException()
+                    }
+                }
+                _mmprojLoaded = isVisionEnabled()
+                isMultimodal = _mmprojLoaded
+                Log.i(TAG, "isVisionEnabled native result=$_mmprojLoaded")
+                if (mmprojPath != null && !_mmprojLoaded) {
+                    throw IllegalArgumentException("mmproj 不支持视觉输入")
                 }
                 prepare(
                     params.contextSize,
@@ -231,8 +258,11 @@ internal class InferenceEngineImpl private constructor(
         message: String,
         predictLength: Int,
         sampling: SamplingParams,
+        imagePaths: List<String>,
     ): Flow<String> = flow {
-        require(message.isNotEmpty()) { "User prompt discarded due to being empty!" }
+        require(message.isNotEmpty() || imagePaths.isNotEmpty()) {
+            "User prompt discarded due to being empty!"
+        }
         check(_state.value is InferenceEngine.State.ModelReady) {
             "User prompt discarded due to: ${_state.value.javaClass.simpleName}"
         }
@@ -253,10 +283,27 @@ internal class InferenceEngineImpl private constructor(
                 sampling.seed,
             )
 
-            processUserPrompt(message, predictLength).let { result ->
-                if (result != 0) {
-                    Log.e(TAG, "Failed to process user prompt: $result")
-                    return@flow
+            // With a vision model, always go through mtmd: markers from earlier
+            // image messages survive in the re-formatted conversation history,
+            // so the bitmap count must match whatever the text path would render.
+            val useMtmd = _mmprojLoaded || imagePaths.isNotEmpty()
+            val result = if (useMtmd) {
+                if (!_mmprojLoaded) {
+                    throw IllegalStateException("当前模型未加载 mmproj，无法处理图片")
+                }
+                processUserPromptMtmd(message, imagePaths.toTypedArray(), predictLength)
+            } else {
+                processUserPrompt(message, predictLength)
+            }
+            result.let {
+                when (it) {
+                    0 -> {}
+                    1 -> throw IllegalStateException("当前模型未加载 mmproj")
+                    5 -> throw IllegalStateException("用户输入超过上下文长度，请缩短消息或增大上下文")
+                    else -> {
+                        Log.e(TAG, "Failed to process user prompt: $it")
+                        return@flow
+                    }
                 }
             }
 
@@ -323,6 +370,8 @@ internal class InferenceEngineImpl private constructor(
                     _state.value = InferenceEngine.State.UnloadingModel
 
                     unload()
+                    _mmprojLoaded = false
+                    isMultimodal = false
 
                     _state.value = InferenceEngine.State.Initialized
                     Log.i(TAG, "Model unloaded!")
@@ -331,6 +380,8 @@ internal class InferenceEngineImpl private constructor(
 
                 is InferenceEngine.State.Error -> {
                     Log.i(TAG, "Resetting error states...")
+                    _mmprojLoaded = false
+                    isMultimodal = false
                     _state.value = InferenceEngine.State.Initialized
                     Log.i(TAG, "States reset!")
                     Unit
@@ -359,6 +410,9 @@ internal class InferenceEngineImpl private constructor(
                 is InferenceEngine.State.Initialized -> shutdown()
                 else -> { unload(); shutdown() }
             }
+            // Leave no stale state behind: any later load in this process would
+            // otherwise try to unload already-freed native resources.
+            _state.value = InferenceEngine.State.Uninitialized
         }
         llamaScope.cancel()
     }

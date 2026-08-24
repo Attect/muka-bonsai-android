@@ -10,6 +10,8 @@
 #include "chat.h"
 #include "common.h"
 #include "llama.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
 
 template<class T>
 static std::string join(const std::vector<T> &values, const std::string &delim) {
@@ -40,12 +42,19 @@ static llama_context                    * g_context;
 static llama_batch                        g_batch;
 static common_chat_templates_ptr          g_chat_templates;
 static common_sampler                   * g_sampler;
+// Multimodal projector context (mmproj). Null when no mmproj was loaded.
+static mtmd_context                     * g_mtmd;
+// Guard for llama_batch_free: the batch is only initialized in prepare().
+static bool                              g_batch_initialized = false;
 
 extern "C"
 JNIEXPORT void JNICALL
 Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_init(JNIEnv *env, jobject /*unused*/, jstring nativeLibDir) {
     // Set llama log handler to Android
     llama_log_set(aichat_android_log_callback, nullptr);
+
+    // Route mtmd (multimodal projector) logging to Logcat as well.
+    mtmd_helper_log_set(aichat_android_log_callback, nullptr);
 
     // Loading all CPU backend variants
     const auto *path_to_backend = env->GetStringUTFChars(nativeLibDir, 0);
@@ -60,7 +69,7 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_init(JNIEnv *env, jobjec
 
 extern "C"
 JNIEXPORT jint JNICALL
-Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstring jmodel_path) {
+Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstring jmodel_path, jstring jmmproj_path) {
     llama_model_params model_params = llama_model_default_params();
     // Offload as many layers as possible to the GPU (OpenCL/Adreno). Ops that
     // the GPU backend cannot run automatically fall back to the CPU.
@@ -75,7 +84,46 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_load(JNIEnv *env, jobjec
         return 1;
     }
     g_model = model;
+
+    // Optional multimodal projector (mmproj, e.g. Bonsai-27B-mmproj-Q8_0.gguf).
+    // The projector runs on the GPU like the text model; unsupported ops fall
+    // back to the CPU inside clip's scheduler.
+    const auto *mmproj_path = env->GetStringUTFChars(jmmproj_path, nullptr);
+    if (mmproj_path != nullptr && mmproj_path[0] != '\0') {
+        LOGi("%s: Loading mmproj from: \n%s\n", __func__, mmproj_path);
+        mtmd_context_params mtmd_params = mtmd_context_params_default();
+        // Image encoding runs on the CPU (clip sched): the OpenCL path crashed
+        // inside the graph allocator on Adreno 8 Elite in real encoding passes.
+        // The text model itself still runs on OpenCL (n_gpu_layers = 99 above).
+        mtmd_params.use_gpu = false;
+        mtmd_params.print_timings = false;
+        g_mtmd = mtmd_init_from_file(mmproj_path, model, mtmd_params);
+        env->ReleaseStringUTFChars(jmmproj_path, mmproj_path);
+        if (!g_mtmd) {
+            LOGe("%s: Failed to initialize mtmd context from mmproj", __func__);
+            return 2;
+        }
+        if (!mtmd_support_vision(g_mtmd)) {
+            LOGe("%s: mmproj does not support vision input", __func__);
+            mtmd_free(g_mtmd);
+            g_mtmd = nullptr;
+            return 2;
+        }
+        LOGi("%s: mmproj loaded, marker = %s", __func__, mtmd_get_marker(g_mtmd));
+    } else {
+        if (mmproj_path != nullptr) {
+            env->ReleaseStringUTFChars(jmmproj_path, mmproj_path);
+        }
+        g_mtmd = nullptr;
+    }
+
     return 0;
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_isVisionEnabled(JNIEnv * /*env*/, jobject /*unused*/) {
+    return g_mtmd != nullptr && mtmd_support_vision(g_mtmd);
 }
 
 static ggml_type kv_ggml_type(const int kv_type) {
@@ -163,6 +211,7 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_prepare(
     if (!context) { return 1; }
     g_context = context;
     g_batch = llama_batch_init(BATCH_SIZE, 0, 1);
+    g_batch_initialized = true;
     g_chat_templates = common_chat_templates_init(g_model, "");
     g_sampler = new_sampler(temperature);
     return 0;
@@ -311,7 +360,7 @@ static void reset_long_term_states(const bool clear_kv_cache = true) {
     system_prompt_position = 0;
     current_position = 0;
 
-    if (clear_kv_cache)
+    if (clear_kv_cache && g_context)
         llama_memory_clear(llama_get_memory(g_context), false);
 }
 
@@ -504,6 +553,124 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_processUserPrompt(
     return 0;
 }
 
+/**
+ * Multimodal user prompt: renders the conversation (which keeps one media
+ * marker per attached image in the message content) and sends it through
+ * mtmd, which replaces each marker with the corresponding image tile tokens.
+ *
+ * With a vision model this path is used even for text-only turns: markers from
+ * earlier image messages remain in the re-formatted history, so the bitmap
+ * count must match the marker count every time.
+ *
+ * Return codes: 0 = success, 1 = mtmd not loaded, 2 = marker/bitmap mismatch,
+ * 3 = image load failure, 4 = tokenization failure, 5 = prompt too long for
+ * the context, 6 = decode failure.
+ */
+extern "C"
+JNIEXPORT jint JNICALL
+Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_processUserPromptMtmd(
+        JNIEnv *env,
+        jobject /*unused*/,
+        jstring juser_prompt,
+        jobjectArray jimage_paths,
+        jint n_predict) {
+    if (!g_mtmd) {
+        LOGe("%s: mtmd context is not loaded", __func__);
+        return 1;
+    }
+
+    reset_short_term_states();
+
+    const auto *user_prompt = env->GetStringUTFChars(juser_prompt, nullptr);
+    LOGd("%s: User prompt received: \n%s\n", __func__, user_prompt);
+    std::string content(user_prompt);
+    env->ReleaseStringUTFChars(juser_prompt, user_prompt);
+
+    const char *marker = mtmd_get_marker(g_mtmd);
+    if (marker == nullptr || marker[0] == '\0') {
+        marker = mtmd_default_marker();
+    }
+
+    // One marker per image of the current turn, appended after the prompt text.
+    // Only the new-message fragment is formatted & decoded each turn (the rest
+    // of the conversation stays in the KV cache), so just this turn's images.
+    std::vector<std::string> images;
+    const jsize n_new_images = env->GetArrayLength(jimage_paths);
+    for (jsize i = 0; i < n_new_images; i++) {
+        const auto jpath = (jstring) env->GetObjectArrayElement(jimage_paths, i);
+        const auto *path = env->GetStringUTFChars(jpath, nullptr);
+        images.emplace_back(path);
+        env->ReleaseStringUTFChars(jpath, path);
+        env->DeleteLocalRef(jpath);
+        if (!content.empty() && content.back() != '\n') {
+            content += "\n";
+        }
+        content += marker;
+    }
+
+    // Format the user message (with markers) and append it to the history.
+    std::string formatted(content);
+    const bool has_chat_template = common_chat_templates_was_explicit(g_chat_templates.get());
+    if (has_chat_template) {
+        formatted = chat_add_and_format(ROLE_USER, content);
+    }
+
+    // Load one bitmap per marker in the current message fragment.
+    std::vector<mtmd_bitmap *> bitmaps;
+    bitmaps.reserve(images.size());
+    for (const auto &path : images) {
+        auto img = mtmd_helper_bitmap_init_from_file(g_mtmd, path.c_str(), false);
+        if (!img.bitmap) {
+            LOGe("%s: Failed to load image file: %s", __func__, path.c_str());
+            for (auto *b : bitmaps) {
+                mtmd_bitmap_free(b);
+            }
+            return 3;
+        }
+        bitmaps.push_back(img.bitmap);
+    }
+
+    mtmd_input_text in_text{formatted.data(), formatted.size(), /* add_special */ true, /* parse_special */ true};
+    mtmd::input_chunks chunks(mtmd_input_chunks_init());
+    const int32_t tokenized = mtmd_tokenize(g_mtmd, chunks.ptr.get(), &in_text,
+                                            const_cast<const mtmd_bitmap **>(bitmaps.data()), bitmaps.size());
+    for (auto *b : bitmaps) {
+        mtmd_bitmap_free(b);
+    }
+    if (tokenized != 0) {
+        LOGe("%s: mtmd_tokenize failed with %d", __func__, tokenized);
+        return 4;
+    }
+
+    // Image prompts cannot be truncated (marker chunks are tied to bitmaps),
+    // so reject an overflow instead of silently dropping content.
+    const size_t n_prompt = mtmd_helper_get_n_tokens(chunks.ptr.get());
+    const size_t usable = (size_t) llama_n_ctx(g_context) - OVERFLOW_HEADROOM;
+    LOGi("%s: mtmd prompt: %zu tokens @ position %d (remaining %llu)",
+         __func__, n_prompt, current_position,
+         (unsigned long long) (current_position < (llama_pos) usable ? usable - current_position : 0));
+    if (n_prompt + current_position > usable) {
+        LOGe("%s: mtmd prompt too long for context! %zu tokens, remaining: %zu",
+             __func__, n_prompt, usable > (size_t) current_position ? usable - current_position : 0);
+        return 5;
+    }
+
+    // Decode the chunks: text via llama_decode, image tiles via the projector.
+    llama_pos new_past = current_position;
+    const int32_t res = mtmd_helper_eval_chunks(
+            g_mtmd, g_context, chunks.ptr.get(), current_position, /* seq_id */ 0,
+            llama_n_batch(g_context), /* logits_last */ true, &new_past);
+    if (res != 0) {
+        LOGe("%s: mtmd_helper_eval_chunks failed with %d", __func__, res);
+        return 6;
+    }
+    LOGi("%s: mtmd prompt processed, position %d -> %d", __func__, current_position, new_past);
+    current_position = new_past;
+    max_new_tokens = n_predict;
+    generated_token_count = 0;
+    return 0;
+}
+
 static bool is_valid_utf8(const char *string) {
     if (!string) { return true; }
 
@@ -623,12 +790,28 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_unload(JNIEnv * /*unused
     reset_long_term_states();
     reset_short_term_states();
 
-    // Free up resources
+    // Free up resources. Every pointer is nulled so a second unload (e.g. an
+    // activity being destroyed right after another one loaded) cannot touch
+    // freed state. Idempotent by construction.
     common_sampler_free(g_sampler);
+    g_sampler = nullptr;
     g_chat_templates.reset();
-    llama_batch_free(g_batch);
-    llama_free(g_context);
-    llama_model_free(g_model);
+    if (g_batch_initialized) {
+        llama_batch_free(g_batch);
+        g_batch_initialized = false;
+    }
+    if (g_context) {
+        llama_free(g_context);
+        g_context = nullptr;
+    }
+    if (g_model) {
+        llama_model_free(g_model);
+        g_model = nullptr;
+    }
+    if (g_mtmd) {
+        mtmd_free(g_mtmd);
+        g_mtmd = nullptr;
+    }
 }
 
 extern "C"

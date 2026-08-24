@@ -1,5 +1,9 @@
 package app.muka.bonsai.ui
 
+import android.graphics.BitmapFactory
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,14 +16,20 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.ClearAll
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -39,6 +49,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import app.muka.bonsai.ui.components.ThinkSection
@@ -48,6 +61,10 @@ import app.muka.bonsai.ui.markdown.ThinkParser
 @Composable
 fun ChatPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
     val uiState by viewModel.uiState.collectAsState()
+
+    val imagePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri -> uri?.let(viewModel::attachImage) }
 
     Column(
         modifier = modifier
@@ -84,6 +101,10 @@ fun ChatPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
             onStop = viewModel::stopGeneration,
             isGenerating = uiState.isGenerating,
             enabled = uiState.modelPath != null,
+            canAttachImage = uiState.isMultimodal,
+            pendingImagePath = uiState.pendingImagePath,
+            onAttachImage = { imagePicker.launch("image/*") },
+            onRemoveImage = viewModel::clearPendingImage,
             modifier = Modifier.fillMaxWidth()
         )
     }
@@ -208,6 +229,17 @@ internal fun MessageBubble(message: ChatMessage) {
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 if (isUser) {
+                    if (message.imagePath != null) {
+                        AttachedImage(
+                            path = message.imagePath,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                        )
+                        if (message.text.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                        }
+                    }
                     Text(
                         text = message.text,
                         style = MaterialTheme.typography.bodyMedium
@@ -244,35 +276,93 @@ private fun ChatInput(
     onStop: () -> Unit,
     isGenerating: Boolean,
     enabled: Boolean,
+    canAttachImage: Boolean,
+    pendingImagePath: String?,
+    onAttachImage: () -> Unit,
+    onRemoveImage: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Row(
-        modifier = modifier
-            .padding(8.dp)
-            .fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        OutlinedTextField(
-            value = value,
-            onValueChange = onValueChange,
-            placeholder = { Text(if (enabled) "输入消息…" else "请在“模型”页加载模型") },
-            enabled = enabled && !isGenerating,
-            modifier = Modifier.weight(1f),
-            maxLines = 4
-        )
-        if (isGenerating) {
-            IconButton(onClick = onStop) {
-                Icon(Icons.Default.Stop, contentDescription = "停止")
-            }
-        } else {
-            IconButton(
-                onClick = onSend,
-                enabled = enabled && value.isNotBlank()
+    Column(modifier = modifier.padding(8.dp).fillMaxWidth()) {
+        if (pendingImagePath != null) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送")
+                AttachedImage(
+                    path = pendingImagePath,
+                    modifier = Modifier
+                        .size(width = 72.dp, height = 72.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                )
+                Text(
+                    text = "已附加图片",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.weight(1f))
+                IconButton(onClick = onRemoveImage) {
+                    Icon(Icons.Default.Close, contentDescription = "移除图片")
+                }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            if (canAttachImage) {
+                IconButton(onClick = onAttachImage, enabled = enabled && !isGenerating) {
+                    Icon(Icons.Default.AddPhotoAlternate, contentDescription = "附加图片")
+                }
+            }
+            OutlinedTextField(
+                value = value,
+                onValueChange = onValueChange,
+                placeholder = { Text(if (enabled) "输入消息…" else "请在“模型”页加载模型") },
+                enabled = enabled && !isGenerating,
+                modifier = Modifier.weight(1f),
+                maxLines = 4
+            )
+            if (isGenerating) {
+                IconButton(onClick = onStop) {
+                    Icon(Icons.Default.Stop, contentDescription = "停止")
+                }
+            } else {
+                IconButton(
+                    onClick = onSend,
+                    enabled = enabled && (value.isNotBlank() || pendingImagePath != null)
+                ) {
+                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送")
+                }
             }
         }
+    }
+}
+
+/** Downsampled preview of an image file; null when the file cannot be decoded. */
+@Composable
+private fun AttachedImage(path: String, modifier: Modifier = Modifier) {
+    val bitmap = remember(path) {
+        runCatching {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(path, bounds)
+            var sample = 1
+            while (bounds.outWidth / sample > 1024 || bounds.outHeight / sample > 1024) sample *= 2
+            BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample })
+                ?.asImageBitmap()
+        }.getOrNull()
+    }
+    if (bitmap != null) {
+        Image(
+            bitmap = bitmap,
+            contentDescription = "图片",
+            contentScale = ContentScale.Fit,
+            modifier = modifier
+                .heightIn(max = 220.dp)
+                .widthIn(max = 260.dp)
+        )
     }
 }
 

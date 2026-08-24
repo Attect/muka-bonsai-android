@@ -7,14 +7,17 @@ import android.os.Environment
 import androidx.core.content.getSystemService
 import app.muka.bonsai.llama.gguf.GgufMetadataReader
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 
 class DownloadStatus private constructor(val type: Type, val file: File? = null, val progress: Float = 0f, val reason: String = "") {
     enum class Type { NotDownloaded, Downloading, Downloaded, Failed }
@@ -34,6 +37,9 @@ class DownloadStatus private constructor(val type: Type, val file: File? = null,
     }
 }
 
+/** Classification of an imported file. */
+enum class GgufKind { MODEL, MMPROJ, INVALID }
+
 class ModelManager(private val context: Context) {
 
     private val downloadManager = context.getSystemService<DownloadManager>()
@@ -46,20 +52,66 @@ class ModelManager(private val context: Context) {
 
     fun isDownloaded(model: BonsaiModel): Boolean = modelFile(model).exists()
 
+    // ------------------------------------------------------------------
+    // mmproj pairing
+    // ------------------------------------------------------------------
+
+    /** mmproj file name for a catalog model: "<model base>.mmproj". */
+    fun mmprojFileName(model: BonsaiModel): String =
+        model.filename.removeSuffix(".gguf") + MMPROJ_EXT
+
+    /** mmproj file name paired with a local GGUF file: "<base>.mmproj". */
+    fun mmprojFileNameFor(modelFile: File): String =
+        modelFile.nameWithoutExtension + MMPROJ_EXT
+
+    fun mmprojFile(model: BonsaiModel): File = File(modelsDir, mmprojFileName(model))
+
+    fun mmprojFileFor(modelFile: File): File = File(modelsDir, mmprojFileNameFor(modelFile))
+
+    fun hasMmproj(model: BonsaiModel): Boolean =
+        model.mmprojFilename != null && mmprojFile(model).exists()
+
+    fun hasMmprojFor(modelFile: File): Boolean = mmprojFileFor(modelFile).exists()
+
+    /**
+     * Download [model] (and its mmproj when configured) through the
+     * DownloadManager, emitting status updates. Already-downloaded files are
+     * skipped, so this can also be used to fetch a missing mmproj later.
+     */
+    fun downloadModel(model: BonsaiModel, source: DownloadSource): Flow<DownloadStatus> = flow {
+        val gguf = modelFile(model)
+        if (!gguf.exists()) {
+            val status = awaitDownloadFile(
+                url = model.downloadUrl(source),
+                fileName = model.filename,
+                title = "${model.family} ${model.sizeParam}",
+            )
+            if (status.type != DownloadStatus.Type.Downloaded) return@flow
+        }
+        val mmprojFileName = model.mmprojFilename?.let { mmprojFileName(model) }
+        if (mmprojFileName != null && !File(modelsDir, mmprojFileName).exists()) {
+            awaitDownloadFile(
+                url = model.mmprojDownloadUrl(source) ?: return@flow,
+                fileName = mmprojFileName,
+                title = "${model.id} 多模态投影",
+            )
+        }
+    }.flowOn(Dispatchers.IO)
+
     /**
      * DownloadManager can only write to external storage, so downloads land in the
      * app-specific external dir first and are moved to [modelsDir] on completion.
      */
-    private fun downloadStagingFile(model: BonsaiModel): File {
+    private fun stagingFile(fileName: String): File {
         val dir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
             ?: throw IllegalStateException("外部存储不可用，无法下载")
-        return File(dir, model.filename)
+        return File(dir, fileName)
     }
 
     /** Move a completed staging download into [modelsDir]. */
-    private fun moveStagingToModels(model: BonsaiModel): File {
-        val staging = downloadStagingFile(model)
-        val dest = modelFile(model)
+    private fun moveStagingToModels(fileName: String): File {
+        val staging = stagingFile(fileName)
+        val dest = File(modelsDir, fileName)
         if (dest.exists()) dest.delete()
         if (!staging.renameTo(dest)) {
             staging.copyTo(dest, overwrite = true)
@@ -68,17 +120,48 @@ class ModelManager(private val context: Context) {
         return dest
     }
 
+    private suspend fun enqueueDownload(url: String, fileName: String, title: String): Long =
+        withContext(Dispatchers.IO) {
+            // Remove any stale partial download from a previous attempt.
+            stagingFile(fileName).delete()
+
+            val request = DownloadManager.Request(Uri.parse(url))
+                .setTitle(title)
+                .setDescription(if (fileName.endsWith(MMPROJ_EXT)) "Downloading multimodal projector…" else "Downloading GGUF model…")
+                .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                .setDestinationInExternalFilesDir(context, Environment.DIRECTORY_DOWNLOADS, fileName)
+                .setAllowedOverMetered(false)
+                .setAllowedOverRoaming(false)
+
+            downloadManager.enqueue(request)
+        }
+
+    /** Enqueue the download and emit status until a terminal state, returning it. */
+    private suspend fun FlowCollector<DownloadStatus>.awaitDownloadFile(
+        url: String,
+        fileName: String,
+        title: String,
+    ): DownloadStatus {
+        val id = enqueueDownload(url, fileName, title)
+        var last: DownloadStatus = DownloadStatus.NotDownloaded
+        downloadStatus(fileName, id).collect { status ->
+            last = status
+            emit(status)
+        }
+        return last
+    }
+
     /**
-     * Returns a [Flow] that emits the current download status of [model].
+     * Returns a [Flow] that emits the current download status of a file.
      *
      * Completion is driven by polling the DownloadManager status instead of the
      * ACTION_DOWNLOAD_COMPLETE broadcast, which is not always delivered to
      * runtime-registered receivers. The flow completes when the download reaches
      * a terminal state.
      */
-    fun downloadStatus(model: BonsaiModel, downloadId: Long? = null): Flow<DownloadStatus> =
+    fun downloadStatus(fileName: String, downloadId: Long? = null): Flow<DownloadStatus> =
         callbackFlow {
-            val file = modelFile(model)
+            val file = File(modelsDir, fileName)
             if (file.exists()) {
                 trySend(DownloadStatus.Downloaded(file))
                 close()
@@ -96,7 +179,7 @@ class ModelManager(private val context: Context) {
                     when (queryStatus(downloadId)) {
                         DownloadManager.STATUS_SUCCESSFUL -> {
                             // The destination file can lag the status flip by a moment.
-                            val staging = downloadStagingFile(model)
+                            val staging = stagingFile(fileName)
                             var waited = 0
                             while (!staging.exists() && waited < 10_000) {
                                 delay(500)
@@ -104,7 +187,7 @@ class ModelManager(private val context: Context) {
                             }
                             if (staging.exists()) {
                                 try {
-                                    val dest = moveStagingToModels(model)
+                                    val dest = moveStagingToModels(fileName)
                                     trySend(DownloadStatus.Downloaded(dest))
                                 } catch (e: Exception) {
                                     trySend(DownloadStatus.Failed("移动到模型目录失败: ${e.message}"))
@@ -116,7 +199,7 @@ class ModelManager(private val context: Context) {
                             break
                         }
                         DownloadManager.STATUS_FAILED -> {
-                            downloadStagingFile(model).delete()
+                            stagingFile(fileName).delete()
                             trySend(DownloadStatus.Failed("Download failed: ${queryReason(downloadId)}"))
                             close()
                             break
@@ -137,38 +220,34 @@ class ModelManager(private val context: Context) {
         }.flowOn(Dispatchers.IO)
 
     /**
-     * Enqueue a DownloadManager request for [model] via [source]. Returns the download ID.
-     */
-    suspend fun enqueueDownload(model: BonsaiModel, source: DownloadSource): Long = withContext(Dispatchers.IO) {
-        // Remove any stale partial download from a previous attempt.
-        downloadStagingFile(model).delete()
-
-        val request = DownloadManager.Request(Uri.parse(model.downloadUrl(source)))
-            .setTitle("${model.family} ${model.sizeParam}")
-            .setDescription("Downloading GGUF model…")
-            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            .setDestinationInExternalFilesDir(context, Environment.DIRECTORY_DOWNLOADS, model.filename)
-            .setAllowedOverMetered(false)
-            .setAllowedOverRoaming(false)
-
-        downloadManager.enqueue(request)
-    }
-
-    /**
-     * Delete a downloaded model file.
+     * Delete a downloaded model file together with its paired mmproj.
      */
     suspend fun deleteModel(model: BonsaiModel) = withContext(Dispatchers.IO) {
         modelFile(model).delete()
+        mmprojFile(model).delete()
     }
 
     /**
-     * Scan [modelsDir] and return any GGUF files found there.
+     * Scan [modelsDir] and return any local GGUF model files found there.
+     * Projector (mmproj) files are excluded by their metadata architecture.
      */
     suspend fun scanLocalModels(): List<File> = withContext(Dispatchers.IO) {
-        android.util.Log.i("ModelManager", "Scanning ${modelsDir.absolutePath}, exists=${modelsDir.exists()}, canRead=${modelsDir.canRead()}")
-        val files = modelsDir.listFiles { _, name -> name.endsWith(".gguf", ignoreCase = true) }
-        android.util.Log.i("ModelManager", "Found ${files?.size ?: 0} files: ${files?.map { it.name }}")
+        val gguFs = modelsDir.listFiles { _, name -> name.lowercase().endsWith(GGUF_EXT) }
+        val files = gguFs?.filter { file ->
+            file.inputStream().buffered().use { input ->
+                runCatching {
+                    GgufMetadataReader.create().readStructuredMetadata(input)
+                        .architecture?.architecture != CLIP_ARCH
+                }.getOrDefault(true)
+            }
+        }
+        android.util.Log.i("ModelManager", "Scanning ${modelsDir.absolutePath}: found ${files?.size ?: 0} models")
         files?.toList() ?: emptyList()
+    }
+
+    /** Scan [modelsDir] and return any mmproj projector files found there. */
+    suspend fun scanLocalMmproj(): List<File> = withContext(Dispatchers.IO) {
+        modelsDir.listFiles { _, name -> name.lowercase().endsWith(MMPROJ_EXT) }?.toList() ?: emptyList()
     }
 
     /**
@@ -179,7 +258,9 @@ class ModelManager(private val context: Context) {
      */
     suspend fun sweepStagingDownloads() = withContext(Dispatchers.IO) {
         val stagingDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: return@withContext
-        stagingDir.listFiles { _, name -> name.endsWith(".gguf", ignoreCase = true) }?.forEach { staging ->
+        stagingDir.listFiles { _, name ->
+            name.lowercase().endsWith(GGUF_EXT) || name.lowercase().endsWith(MMPROJ_EXT)
+        }?.forEach { staging ->
             val dest = File(modelsDir, staging.name)
             try {
                 if (dest.exists()) dest.delete()
@@ -192,6 +273,41 @@ class ModelManager(private val context: Context) {
                 android.util.Log.w("ModelManager", "Failed to sweep ${staging.name}", e)
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Local import
+    // ------------------------------------------------------------------
+
+    /**
+     * Classify an imported file by name and GGUF metadata: model, mmproj
+     * projector (architecture "clip"), or an unsupported file type.
+     */
+    suspend fun classifyFile(uri: Uri, displayName: String): GgufKind = withContext(Dispatchers.IO) {
+        val lower = displayName.lowercase()
+        when {
+            lower.endsWith(MMPROJ_EXT) -> GgufKind.MMPROJ
+            !lower.endsWith(GGUF_EXT) -> GgufKind.INVALID
+            else -> {
+                val arch = runCatching {
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        GgufMetadataReader.create().readStructuredMetadata(input)
+                            .architecture?.architecture
+                    }
+                }.getOrNull()
+                if (arch == CLIP_ARCH) GgufKind.MMPROJ else GgufKind.MODEL
+            }
+        }
+    }
+
+    /** Copy a content URI into [dest], overwriting it. Returns [dest]. */
+    suspend fun copyUriToFile(uri: Uri, dest: File): File = withContext(Dispatchers.IO) {
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            FileOutputStream(dest).use { output ->
+                input.copyTo(output)
+            }
+        } ?: throw IllegalStateException("Cannot open $uri")
+        dest
     }
 
     /**
@@ -241,5 +357,11 @@ class ModelManager(private val context: Context) {
                 "unknown"
             }
         }
+    }
+
+    companion object {
+        const val GGUF_EXT = ".gguf"
+        const val MMPROJ_EXT = ".mmproj"
+        const val CLIP_ARCH = "clip"
     }
 }

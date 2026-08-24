@@ -17,6 +17,7 @@ import app.muka.bonsai.model.AVAILABLE_MODELS
 import app.muka.bonsai.model.BonsaiModel
 import app.muka.bonsai.model.DownloadSource
 import app.muka.bonsai.model.DownloadStatus
+import app.muka.bonsai.model.GgufKind
 import app.muka.bonsai.model.ModelManager
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -39,6 +40,8 @@ data class ChatMessage(
     val role: Role,
     val text: String,
     val isGenerating: Boolean = false,
+    /** Local path of an image attached to this message (user messages only). */
+    val imagePath: String? = null,
 ) {
     enum class Role { User, Assistant }
 }
@@ -58,9 +61,17 @@ data class AppUiState(
     val params: InferenceParams = InferenceParams(),
     val metrics: PerformanceMetrics = PerformanceMetrics(),
     val localModels: List<File> = emptyList(),
+    /** Locally imported mmproj projector files (paired or orphaned). */
+    val mmprojFiles: List<File> = emptyList(),
     val downloadStatuses: Map<String, DownloadStatus> = emptyMap(),
     /** Model file absolute path -> max context length read from GGUF metadata. */
     val modelContextLengths: Map<String, Int> = emptyMap(),
+    /** Catalog model ids whose GGUF is present but the mmproj is still missing. */
+    val mmprojMissingIds: Set<String> = emptySet(),
+    /** Whether the loaded model has a vision mmproj attached. */
+    val isMultimodal: Boolean = false,
+    /** Local path of the image attached to the next message, if any. */
+    val pendingImagePath: String? = null,
     val apiServerRunning: Boolean = false,
     val apiServerPort: Int = ChatViewModel.API_PORT,
     val apiServerError: String? = null,
@@ -235,21 +246,112 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun loadModelFromUri(uri: Uri) {
+    /**
+     * Import one or more files picked from a document picker. GGUF model files
+     * are stored under their display name; mmproj projectors are stored as
+     * "<model base>.mmproj" so they pair with the model by file name. When a
+     * mmproj is picked alongside exactly one model, it is paired with it.
+     */
+    private data class ImportedEntry(val uri: Uri, val name: String, val kind: GgufKind)
+
+    fun importFiles(uris: List<Uri>) {
         viewModelScope.launch {
             try {
                 _uiState.update { it.copy(errorMessage = null, infoMessage = "正在导入模型…") }
-                val dest = File(modelManager.modelsDir, "imported_${System.currentTimeMillis()}.gguf")
-                copyUriToFile(getApplication(), uri, dest)
-                performLoad(dest)
+                val entries = uris.map { uri ->
+                    val name = displayName(uri)
+                    ImportedEntry(uri, name, modelManager.classifyFile(uri, name))
+                }
+                val models = entries.filter { it.kind == GgufKind.MODEL }
+                val mmprojs = entries.filter { it.kind == GgufKind.MMPROJ }
+                val invalid = entries.filter { it.kind == GgufKind.INVALID }
+
+                // Models keep their display name (deduped if already imported).
+                val modelFiles = models.map { entry ->
+                    val name = uniqueName(modelManager.modelsDir, entry.name)
+                    modelManager.copyUriToFile(entry.uri, name)
+                }
+                // A mmproj picked together with exactly one model is paired with it;
+                // otherwise it keeps its own base name for manual pairing later.
+                val pairBaseName = if (modelFiles.size == 1) modelFiles.first().nameWithoutExtension else null
+                val importedMmproj = mmprojs.map { entry ->
+                    val baseName = pairBaseName ?: entry.name.substringBeforeLast('.')
+                    val dest = uniqueName(modelManager.modelsDir, "$baseName${ModelManager.MMPROJ_EXT}")
+                    modelManager.copyUriToFile(entry.uri, dest)
+                }
+
+                val summary = buildString {
+                    if (modelFiles.isNotEmpty()) append("已导入 ${modelFiles.size} 个模型")
+                    if (importedMmproj.isNotEmpty()) {
+                        if (isNotEmpty()) append("，")
+                        append("已导入 ${importedMmproj.size} 个多模态投影")
+                    }
+                    if (invalid.isNotEmpty()) {
+                        if (isNotEmpty()) append("；")
+                        append("跳过不支持的文件：${invalid.joinToString() { it.name }}")
+                    }
+                }
                 refreshLocalModels()
+                _uiState.update { it.copy(infoMessage = summary.ifEmpty { "未导入任何文件" }) }
+                if (modelFiles.size == 1) {
+                    performLoad(modelFiles.first())
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to import model", e)
-                _uiState.update { it.copy(errorMessage = e.message ?: "导入模型失败") }
+                Log.e(TAG, "Failed to import files", e)
+                _uiState.update { it.copy(errorMessage = e.message ?: "导入失败") }
             }
         }
+    }
+
+    /** Pair a picked mmproj file with a local GGUF model file. */
+    fun associateMmproj(modelFile: File, uri: Uri) {
+        viewModelScope.launch {
+            try {
+                val dest = modelManager.mmprojFileFor(modelFile)
+                modelManager.copyUriToFile(uri, dest)
+                refreshLocalModels()
+                _uiState.update { it.copy(infoMessage = "已关联 mmproj：${dest.name}") }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to associate mmproj", e)
+                _uiState.update { it.copy(errorMessage = e.message ?: "关联 mmproj 失败") }
+            }
+        }
+    }
+
+    /** Remove the mmproj paired with a local model file. */
+    fun removeMmproj(modelFile: File) {
+        viewModelScope.launch {
+            val mmproj = modelManager.mmprojFileFor(modelFile)
+            mmproj.delete()
+            refreshLocalModels()
+            _uiState.update { it.copy(infoMessage = "已移除 mmproj：${mmproj.name}") }
+        }
+    }
+
+    /** Attach an image to the next outgoing message (copied to app cache first). */
+    fun attachImage(uri: Uri) {
+        viewModelScope.launch {
+            try {
+                if (!_uiState.value.isMultimodal) {
+                    _uiState.update { it.copy(errorMessage = "当前模型未加载多模态投影（mmproj），无法发送图片") }
+                    return@launch
+                }
+                val dir = File(getApplication<Application>().cacheDir, "images").apply { mkdirs() }
+                val ext = uri.lastPathSegment?.substringAfterLast('.', "")?.takeIf { it.isNotEmpty() }?.lowercase() ?: "jpg"
+                val dest = File(dir, "img_${System.currentTimeMillis()}.$ext")
+                modelManager.copyUriToFile(uri, dest)
+                _uiState.update { it.copy(pendingImagePath = dest.absolutePath) }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to attach image", e)
+                _uiState.update { it.copy(errorMessage = e.message ?: "图片加载失败") }
+            }
+        }
+    }
+
+    fun clearPendingImage() {
+        _uiState.update { it.copy(pendingImagePath = null) }
     }
 
     fun reloadModel() {
@@ -271,7 +373,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun unloadModel() {
         try {
             engine.cleanUp()
-            _uiState.update { it.copy(modelPath = null, messages = emptyList()) }
+            _uiState.update { it.copy(modelPath = null, messages = emptyList(), isMultimodal = false) }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to unload model", e)
         }
@@ -283,13 +385,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun sendMessage() {
         val text = _uiState.value.inputText.trim()
-        if (text.isEmpty()) return
+        val image = _uiState.value.pendingImagePath
+        if (text.isEmpty() && image == null) return
         if (_uiState.value.isGenerating) return
 
         _uiState.update {
             it.copy(
                 inputText = "",
-                messages = it.messages + ChatMessage(ChatMessage.Role.User, text),
+                pendingImagePath = null,
+                messages = it.messages + ChatMessage(ChatMessage.Role.User, text, imagePath = image),
                 isGenerating = true,
                 metrics = PerformanceMetrics(),
             )
@@ -310,6 +414,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         text,
                         predictLength = _uiState.value.params.maxTokens,
                         sampling = _uiState.value.params.sampling,
+                        imagePaths = if (image != null) listOf(image) else emptyList(),
                     ).collect { token ->
                         buffer.append(token)
                         tokenCount++
@@ -381,8 +486,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun downloadModel(model: BonsaiModel) {
         viewModelScope.launch {
             try {
-                val id = modelManager.enqueueDownload(model, _uiState.value.downloadSource)
-                modelManager.downloadStatus(model, id).collect { status ->
+                modelManager.downloadModel(model, _uiState.value.downloadSource).collect { status ->
                     _uiState.update { state ->
                         state.copy(downloadStatuses = state.downloadStatuses + (model.id to status))
                     }
@@ -390,7 +494,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         // Progress is shown on the model card itself; pushing every
                         // tick into infoMessage would spam the snackbar.
                         DownloadStatus.Type.Downloaded -> {
-                            _uiState.update { it.copy(infoMessage = "${model.id} 已下载") }
+                            _uiState.update {
+                                it.copy(infoMessage = "${model.id} ${if (modelManager.hasMmproj(model)) "（含多模态投影）" else ""} 已下载")
+                            }
                             refreshLocalModels()
                         }
                         DownloadStatus.Type.Failed -> {
@@ -437,13 +543,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             // Pick up downloads that completed while the app was not running.
             modelManager.sweepStagingDownloads()
             val locals = modelManager.scanLocalModels()
+            val mmprojs = modelManager.scanLocalMmproj()
             val statuses = mutableMapOf<String, DownloadStatus>()
+            val missingMmproj = mutableSetOf<String>()
             AVAILABLE_MODELS.forEach { model ->
                 val file = modelManager.modelFile(model)
                 val exists = file.exists()
                 android.util.Log.i(TAG, "Model ${model.id}: path=${file.absolutePath}, exists=$exists")
                 if (exists) {
-                    statuses[model.id] = DownloadStatus.Downloaded(file)
+                    if (model.mmprojFilename != null && !modelManager.hasMmproj(model)) {
+                        missingMmproj += model.id
+                    } else {
+                        statuses[model.id] = DownloadStatus.Downloaded(file)
+                    }
                 }
             }
             // Read each model's max context length from its GGUF header (metadata only, fast).
@@ -458,11 +570,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update {
                 it.copy(
                     localModels = locals,
+                    mmprojFiles = mmprojs,
                     downloadStatuses = pruned + statuses,
                     modelContextLengths = contextLengths,
+                    mmprojMissingIds = missingMmproj,
                 )
             }
-            android.util.Log.i(TAG, "refreshLocalModels done, statuses=${statuses.keys}, contextLengths=$contextLengths")
+            android.util.Log.i(TAG, "refreshLocalModels done, models=${locals.map { it.name }}, mmprojs=${mmprojs.map { it.name }}, missingMmproj=$missingMmproj")
         }
     }
 
@@ -661,9 +775,23 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             // Settings page edits the loaded model's profile from now on.
             _uiState.update { it.copy(params = params) }
-            engine.loadModel(file.absolutePath, params)
+            val pairedMmproj = modelManager.mmprojFileFor(file).takeIf { it.exists() }
+            if (pairedMmproj != null) {
+                android.util.Log.i(TAG, "Loading multimodally with mmproj ${pairedMmproj.absolutePath}")
+            }
+            engine.loadModel(file.absolutePath, params, pairedMmproj?.absolutePath)
             engine.setSystemPrompt(params.systemPrompt)
-            _uiState.update { it.copy(modelPath = file.absolutePath, infoMessage = "模型就绪") }
+            android.util.Log.i(
+                TAG,
+                "performLoad done: mmproj=${pairedMmproj?.absolutePath}, engine.isMultimodal=${engine.isMultimodal}",
+            )
+            _uiState.update {
+                it.copy(
+                    modelPath = file.absolutePath,
+                    infoMessage = if (engine.isMultimodal) "模型就绪（多模态）" else "模型就绪",
+                    isMultimodal = engine.isMultimodal,
+                )
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -728,10 +856,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 }
 
-private fun copyUriToFile(context: Context, uri: Uri, dest: File) {
-    context.contentResolver.openInputStream(uri)?.use { input ->
-        FileOutputStream(dest).use { output ->
-            input.copyTo(output)
+/** Display name of a content URI, falling back to the last path segment. */
+private fun ChatViewModel.displayName(uri: Uri): String {
+    val name = runCatching {
+        getApplication<Application>().contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            if (idx >= 0 && cursor.moveToFirst()) cursor.getString(idx) else null
         }
-    } ?: throw IllegalStateException("Cannot open $uri")
+    }.getOrNull()
+    return name?.takeIf { it.isNotBlank() }
+        ?: uri.lastPathSegment?.substringAfterLast('/') ?: "imported_${System.currentTimeMillis()}.gguf"
+}
+
+/** A non-conflicting file name inside [dir]: inserts a timestamp before the extension if needed. */
+private fun uniqueName(dir: File, name: String): File {
+    val dest = File(dir, name)
+    if (!dest.exists()) return dest
+    val base = name.substringBeforeLast('.', name)
+    val ext = name.substringAfterLast('.', "")
+    val suffixed = if (ext.isEmpty()) "${base}-${System.currentTimeMillis()}" else "$base-${System.currentTimeMillis()}.$ext"
+    return File(dir, suffixed)
 }

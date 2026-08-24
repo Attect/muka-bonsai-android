@@ -1,7 +1,5 @@
 package app.muka.bonsai.ui
 
-import android.app.Activity
-import android.content.Intent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -18,6 +16,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.PlayArrow
@@ -51,12 +50,19 @@ import java.io.File
 fun ModelsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
     val uiState by viewModel.uiState.collectAsState()
 
-    val launcher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            result.data?.data?.let { uri -> viewModel.loadModelFromUri(uri) }
-        }
+    // Multi-file import: pick a GGUF model and its mmproj projector together.
+    val importLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris -> if (uris.isNotEmpty()) viewModel.importFiles(uris) }
+
+    // Per-model mmproj association: remember which model the picker targets.
+    var associateTarget by remember { mutableStateOf<File?>(null) }
+    val mmprojLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        val target = associateTarget
+        if (uri != null && target != null) viewModel.associateMmproj(target, uri)
+        associateTarget = null
     }
 
     Column(
@@ -87,6 +93,8 @@ fun ModelsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
                     model = model,
                     status = status,
                     isLoaded = uiState.modelPath == viewModel.modelManager.modelFile(model).absolutePath,
+                    mmprojPresent = viewModel.modelManager.hasMmproj(model),
+                    mmprojMissing = model.id in uiState.mmprojMissingIds,
                     onDownload = { viewModel.downloadModel(model) },
                     onLoad = { viewModel.loadModel(viewModel.modelManager.modelFile(model)) },
                     onDelete = { viewModel.deleteModel(model) }
@@ -95,7 +103,7 @@ fun ModelsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
 
             item {
                 Text(
-                    text = "本地 GGUF 文件",
+                    text = "本地模型",
                     style = MaterialTheme.typography.titleMedium,
                     modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
                 )
@@ -105,25 +113,44 @@ fun ModelsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
                 LocalModelCard(
                     file = file,
                     isLoaded = uiState.modelPath == file.absolutePath,
+                    mmprojName = viewModel.modelManager.mmprojFileFor(file)
+                        .takeIf { it.exists() }
+                        ?.name,
                     onLoad = { viewModel.loadModel(file) },
-                    onDelete = { viewModel.deleteLocalFile(file) }
+                    onDelete = { viewModel.deleteLocalFile(file) },
+                    onAssociateMmproj = {
+                        associateTarget = file
+                        mmprojLauncher.launch(arrayOf("*/*"))
+                    },
+                    onRemoveMmproj = { viewModel.removeMmproj(file) }
                 )
+            }
+
+            if (uiState.mmprojFiles.isNotEmpty()) {
+                item {
+                    Text(
+                        text = "未配对的多模态投影（mmproj）",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
+                    )
+                }
+                items(uiState.mmprojFiles) { mmproj ->
+                    OrphanMmprojCard(
+                        file = mmproj,
+                        pairedModels = uiState.localModels
+                            .filter { viewModel.modelManager.mmprojFileFor(it).name == mmproj.name }
+                    )
+                }
             }
         }
 
         OutlinedButton(
-            onClick = {
-                val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                    addCategory(Intent.CATEGORY_OPENABLE)
-                    type = "*/*"
-                }
-                launcher.launch(intent)
-            },
+            onClick = { importLauncher.launch(arrayOf("*/*")) },
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(16.dp)
         ) {
-            Text("导入本地 GGUF 文件")
+            Text("导入本地模型（GGUF / mmproj，可多选）")
         }
     }
 }
@@ -133,11 +160,14 @@ private fun ModelCard(
     model: BonsaiModel,
     status: DownloadStatus,
     isLoaded: Boolean,
+    mmprojPresent: Boolean,
+    mmprojMissing: Boolean,
     onDownload: () -> Unit,
     onLoad: () -> Unit,
     onDelete: () -> Unit,
 ) {
     var showDelete by remember { mutableStateOf(false) }
+    val totalFootprint = model.footprintGiB + (model.mmprojFootprintGiB ?: 0.0)
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -156,9 +186,17 @@ private fun ModelCard(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "${model.filename} · ~${model.footprintGiB} GiB",
+                        text = "${model.filename} · ~${String.format("%.1f", totalFootprint)} GiB",
                         style = MaterialTheme.typography.bodySmall
                     )
+                    if (model.mmprojFilename != null) {
+                        Text(
+                            text = if (mmprojPresent) "多模态 · 支持图片输入" else "多模态 · mmproj 未安装",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (mmprojPresent) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
                 when {
                     isLoaded -> {
@@ -181,6 +219,17 @@ private fun ModelCard(
             if (isDownloaded) {
                 Button(onClick = onLoad, modifier = Modifier.fillMaxWidth()) {
                     Text(if (isLoaded) "重新加载" else "加载")
+                }
+                if (mmprojMissing) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    OutlinedButton(
+                        onClick = onDownload,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.Download, contentDescription = null)
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("下载 mmproj（多模态）")
+                    }
                 }
                 Spacer(modifier = Modifier.height(4.dp))
                 OutlinedButton(
@@ -218,7 +267,7 @@ private fun ModelCard(
                 Button(onClick = onDownload, modifier = Modifier.fillMaxWidth()) {
                     Icon(Icons.Default.Download, contentDescription = null)
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("下载")
+                    Text(if (mmprojMissing) "下载 mmproj" else "下载")
                 }
             }
         }
@@ -228,7 +277,7 @@ private fun ModelCard(
         androidx.compose.material3.AlertDialog(
             onDismissRequest = { showDelete = false },
             title = { Text("删除模型？") },
-            text = { Text("这将从设备存储中移除 ${model.filename}。") },
+            text = { Text("这将从设备存储中移除 ${model.filename}${if (model.mmprojFilename != null) " 及其 mmproj" else ""}。") },
             confirmButton = {
                 androidx.compose.material3.TextButton(
                     onClick = { onDelete(); showDelete = false }
@@ -245,8 +294,11 @@ private fun ModelCard(
 private fun LocalModelCard(
     file: File,
     isLoaded: Boolean,
+    mmprojName: String?,
     onLoad: () -> Unit,
     onDelete: () -> Unit,
+    onAssociateMmproj: () -> Unit,
+    onRemoveMmproj: () -> Unit,
 ) {
     var showDelete by remember { mutableStateOf(false) }
 
@@ -256,38 +308,68 @@ private fun LocalModelCard(
             containerColor = MaterialTheme.colorScheme.surfaceContainerLow
         )
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = file.name,
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    text = String.format("%.2f GiB", file.length() / 1024.0 / 1024.0 / 1024.0),
-                    style = MaterialTheme.typography.bodySmall
-                )
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = file.name,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = String.format("%.2f GiB", file.length() / 1024.0 / 1024.0 / 1024.0),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text(
+                        text = if (mmprojName != null) "多模态 · $mmprojName" else "仅文本 · 未关联 mmproj",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (mmprojName != null) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                if (isLoaded) {
+                    Text(
+                        text = "已加载",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 8.dp)
+                    )
+                }
+                IconButton(onClick = onLoad) {
+                    Icon(Icons.Default.PlayArrow, contentDescription = "加载")
+                }
+                IconButton(onClick = { showDelete = true }) {
+                    Icon(Icons.Default.Delete, contentDescription = "删除")
+                }
             }
-            if (isLoaded) {
-                Text(
-                    text = "已加载",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(horizontal = 8.dp)
-                )
-            }
-            IconButton(onClick = onLoad) {
-                Icon(Icons.Default.PlayArrow, contentDescription = "加载")
-            }
-            IconButton(onClick = { showDelete = true }) {
-                Icon(Icons.Default.Delete, contentDescription = "删除")
+
+            Spacer(modifier = Modifier.height(4.dp))
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (mmprojName == null) {
+                    OutlinedButton(onClick = onAssociateMmproj) {
+                        Icon(Icons.Default.AttachFile, contentDescription = null)
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("关联 mmproj…")
+                    }
+                } else {
+                    OutlinedButton(
+                        onClick = onAssociateMmproj,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.AttachFile, contentDescription = null)
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("更换 mmproj")
+                    }
+                    OutlinedButton(onClick = onRemoveMmproj) {
+                        Text("移除 mmproj")
+                    }
+                }
             }
         }
     }
@@ -306,5 +388,28 @@ private fun LocalModelCard(
                 androidx.compose.material3.TextButton(onClick = { showDelete = false }) { Text("取消") }
             }
         )
+    }
+}
+
+@Composable
+private fun OrphanMmprojCard(file: File, pairedModels: List<File>) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow
+        )
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text(
+                text = file.name,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                text = pairedModels.takeIf { it.isNotEmpty() }?.joinToString { it.name }
+                    ?: "尚未与任何模型配对，可在模型卡片上“关联 mmproj”",
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
     }
 }

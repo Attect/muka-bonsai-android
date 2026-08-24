@@ -16,14 +16,24 @@ interface InferenceEngine {
     /**
      * Load a model from the given path.
      *
+     * @param mmprojPath Path to a vision projector (mmproj) file, or null for a
+     *                   text-only load. Loading a vision mmproj enables image
+     *                   input in [sendUserPrompt].
      * @throws UnsupportedArchitectureException if model architecture not supported
      */
-    suspend fun loadModel(pathToModel: String, params: InferenceParams = InferenceParams())
+    suspend fun loadModel(
+        pathToModel: String,
+        params: InferenceParams = InferenceParams(),
+        mmprojPath: String? = null,
+    )
 
     /**
      * Sends a system prompt to the loaded model
      */
     suspend fun setSystemPrompt(systemPrompt: String)
+
+    /** Whether the loaded model has a vision mmproj attached (image input enabled). */
+    val isMultimodal: Boolean
 
     /**
      * Sends a user prompt to the loaded model and returns a Flow of generated tokens.
@@ -31,11 +41,15 @@ interface InferenceEngine {
      * @param sampling sampling parameters for this generation; applied right
      *                 before decoding starts, so changes take effect immediately
      *                 without reloading the model
+     * @param imagePaths Paths to image files attached to this turn. Ignored when
+     *                   the model was loaded without an mmproj; images are only
+     *                   accepted on multimodal models.
      */
     fun sendUserPrompt(
         message: String,
         predictLength: Int = DEFAULT_PREDICT_LENGTH,
         sampling: SamplingParams = SamplingParams(),
+        imagePaths: List<String> = emptyList(),
     ): Flow<String>
 
     /**
