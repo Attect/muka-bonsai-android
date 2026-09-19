@@ -101,9 +101,11 @@ fun ChatPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
             onStop = viewModel::stopGeneration,
             isGenerating = uiState.isGenerating,
             enabled = uiState.modelPath != null,
-            canAttachImage = uiState.isMultimodal,
+            canAttachImage = uiState.modelPath != null,
             pendingImagePath = uiState.pendingImagePath,
-            onAttachImage = { imagePicker.launch("image/*") },
+            onAttachImage = {
+                if (uiState.isMultimodal) imagePicker.launch("image/*") else viewModel.warnMissingMmproj()
+            },
             onRemoveImage = viewModel::clearPendingImage,
             modifier = Modifier.fillMaxWidth()
         )

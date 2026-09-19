@@ -414,12 +414,27 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Message naming the projector the loaded model is missing, and where to get it. */
+    private fun missingMmprojMessage(): String {
+        val expected = _uiState.value.modelPath?.let { modelManager.mmprojFileFor(File(it)).name }
+        return if (expected != null) {
+            "当前模型缺少多模态投影（mmproj）$expected，无法发送图片；请在模型页下载或导入它，然后重新加载模型"
+        } else {
+            "当前模型未加载多模态投影（mmproj），无法发送图片"
+        }
+    }
+
+    /** Shown when the attach button is tapped while no projector is loaded. */
+    fun warnMissingMmproj() {
+        _uiState.update { it.copy(errorMessage = missingMmprojMessage()) }
+    }
+
     /** Attach an image to the next outgoing message (copied to app cache first). */
     fun attachImage(uri: Uri) {
         viewModelScope.launch {
             try {
                 if (!_uiState.value.isMultimodal) {
-                    _uiState.update { it.copy(errorMessage = "当前模型未加载多模态投影（mmproj），无法发送图片") }
+                    _uiState.update { it.copy(errorMessage = missingMmprojMessage()) }
                     return@launch
                 }
                 val dir = File(getApplication<Application>().cacheDir, "images").apply { mkdirs() }
