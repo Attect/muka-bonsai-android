@@ -199,6 +199,9 @@ internal class GgufMetadataReaderImpl(
         fun String.u32()  = (m[this] as? MetadataValue.UInt32)?.value?.toInt()
         fun String.f32()  = (m[this] as? MetadataValue.Float32)?.value
         fun String.f64()  = (m[this] as? MetadataValue.Float64)?.value?.toFloat()
+        // Authors may emit either width for the same key, so accept both.
+        fun String.num()  = f32() ?: f64()
+        fun String.anyInt() = i32() ?: u32()
         fun String.strList(): List<String>? =
             (m[this] as? MetadataValue.ArrayVal)
                 ?.elements
@@ -313,6 +316,12 @@ internal class GgufMetadataReaderImpl(
             usedCount  = "$arch.expert_used_count".u32()
         ).takeUnless { count == null && usedCount == null }
 
+        val sampling = GgufMetadata.SamplingInfo(
+            temp = "general.sampling.temp".num(),
+            topK = "general.sampling.top_k".anyInt(),
+            topP = "general.sampling.top_p".num()
+        ).takeUnless { temp == null && topK == null && topP == null }
+
         return GgufMetadata(
             version = version,
             tensorCount = tensorCnt,
@@ -326,7 +335,8 @@ internal class GgufMetadataReaderImpl(
             dimensions = dimensions,
             attention = attention,
             rope = rope,
-            experts = experts
+            experts = experts,
+            sampling = sampling
         )
     }
 

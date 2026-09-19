@@ -64,6 +64,18 @@ interface InferenceEngine {
     suspend fun bench(pp: Int, tg: Int, pl: Int, nr: Int = 1): String
 
     /**
+     * Encode [text] with the loaded model's tokenizer.
+     * Returns null when no model is loaded.
+     */
+    suspend fun tokenize(text: String): IntArray?
+
+    /**
+     * Render [tokens] back into text with the loaded model's tokenizer.
+     * Returns null when no model is loaded or the render failed.
+     */
+    suspend fun detokenize(tokens: IntArray): String?
+
+    /**
      * Cancel an in-progress generation without unloading the model.
      */
     fun stopGeneration()

@@ -91,6 +91,10 @@ internal class InferenceEngineImpl private constructor(
 
     private external fun benchModel(pp: Int, tg: Int, pl: Int, nr: Int): String
 
+    private external fun tokenizeText(text: String): IntArray?
+
+    private external fun detokenizeText(ids: IntArray): String?
+
     private external fun processSystemPrompt(systemPrompt: String): Int
 
     private external fun processUserPrompt(userPrompt: String, predictLength: Int): Int
@@ -346,6 +350,17 @@ internal class InferenceEngineImpl private constructor(
                 _state.value = InferenceEngine.State.ModelReady
             }
         }
+
+    /**
+     * Tokenizer accessors for the vocabulary-analysis page. Both yield null when no
+     * model is resident; the native guards own that, not the engine state here,
+     * because a loaded-but-idle model is exactly when they are usable.
+     */
+    override suspend fun tokenize(text: String): IntArray? =
+        withContext(llamaDispatcher) { tokenizeText(text) }
+
+    override suspend fun detokenize(tokens: IntArray): String? =
+        withContext(llamaDispatcher) { detokenizeText(tokens) }
 
     /**
      * Cancel an in-progress generation without unloading the model.

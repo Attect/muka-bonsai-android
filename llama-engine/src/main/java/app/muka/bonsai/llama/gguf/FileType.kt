@@ -47,6 +47,17 @@ enum class FileType(val code: Int, val label: String) {
     MOSTLY_BF16      (32, "BF16"),
     MOSTLY_TQ1_0     (36, "TQ1_0 - 1.69 bpw ternary"),
     MOSTLY_TQ2_0     (37, "TQ2_0 - 2.06 bpw ternary"),
+    MOSTLY_MXFP4_MOE (38, "MXFP4_MOE"),
+    MOSTLY_NVFP4     (39, "NVFP4"),
+
+    /* This fork's ternary Bonsai 1 packings ------------------------------- */
+    MOSTLY_Q1_0      (40, "Q1_0"),
+    MOSTLY_Q2_0      (41, "Q2_0"),
+
+    /* PrismML Bonsai 2 packings ------------------------------------------- */
+    MOSTLY_PQ2_0         (141, "PQ2_0 - 2.13 bpw ternary"),
+    MOSTLY_PQ2_0_LEGACY  (142, "PQ2_0 - 2.13 bpw ternary (legacy id)"),
+    MOSTLY_PTQ1_0        (143, "PTQ1_0 - 1.75 bpw ternary"),
 
     /* Special flag -------------------------------------------------------- */
     GUESSED(1024, "(guessed)"),

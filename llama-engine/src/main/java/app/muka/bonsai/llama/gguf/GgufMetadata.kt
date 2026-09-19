@@ -24,7 +24,10 @@ data class GgufMetadata(
     val dimensions: DimensionsInfo? = null,
     val attention: AttentionInfo? = null,
     val rope: RopeInfo? = null,
-    val experts: ExpertsInfo? = null
+    val experts: ExpertsInfo? = null,
+
+    // Recommended sampler settings shipped by the model author
+    val sampling: SamplingInfo? = null
 ) {
     enum class GgufVersion(val code: Int, val label: String) {
         /** First public draft; little‑endian only, no alignment key. */
@@ -128,5 +131,12 @@ data class GgufMetadata(
     data class ExpertsInfo(
         val count: Int? = null,
         val usedCount: Int? = null,
+    )
+
+    /** `general.sampling.*`: the sampler defaults the author ships with the model. */
+    data class SamplingInfo(
+        val temp: Float? = null,
+        val topK: Int? = null,
+        val topP: Float? = null,
     )
 }

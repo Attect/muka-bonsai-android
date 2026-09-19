@@ -5,6 +5,7 @@ import android.content.Context
 import android.net.Uri
 import android.os.Environment
 import androidx.core.content.getSystemService
+import app.muka.bonsai.llama.gguf.GgufMetadata
 import app.muka.bonsai.llama.gguf.GgufMetadataReader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
@@ -311,13 +312,13 @@ class ModelManager(private val context: Context) {
     }
 
     /**
-     * Read the model's maximum context length (`<arch>.context_length`) from GGUF metadata.
-     * Returns null if the file cannot be parsed.
+     * Parse a local GGUF header into structured metadata.
+     * Returns null if the file cannot be read or is not GGUF.
      */
-    suspend fun readContextLength(file: File): Int? = withContext(Dispatchers.IO) {
+    suspend fun readMetadata(file: File): GgufMetadata? = withContext(Dispatchers.IO) {
         runCatching {
             file.inputStream().buffered().use { input ->
-                GgufMetadataReader.create().readStructuredMetadata(input).dimensions?.contextLength
+                GgufMetadataReader.create().readStructuredMetadata(input)
             }
         }.onFailure {
             android.util.Log.w("ModelManager", "Failed to read GGUF metadata from ${file.name}", it)

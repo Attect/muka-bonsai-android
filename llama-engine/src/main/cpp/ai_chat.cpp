@@ -783,6 +783,65 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_getLastStopReasonImpl(JN
 }
 
 
+// Vocabulary analysis: expose the loaded model's tokenizer so the UI can count how
+// its input text fragments, and check whether the same text can be restored.
+extern "C"
+JNIEXPORT jintArray JNICALL
+Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_tokenizeText(JNIEnv * env, jobject /*unused*/, jstring jtext) {
+    if (!g_model || !g_context || !jtext) {
+        return nullptr;
+    }
+    const char * utf = env->GetStringUTFChars(jtext, nullptr);
+    if (!utf) {
+        return nullptr;
+    }
+    const std::vector<llama_token> tokens =
+        common_tokenize(g_context, std::string(utf), /*add_special*/ false, /*parse_special*/ true);
+    env->ReleaseStringUTFChars(jtext, utf);
+
+    jintArray out = env->NewIntArray((jsize) tokens.size());
+    if (out) {
+        env->SetIntArrayRegion(out, 0, (jsize) tokens.size(), (const jint *) tokens.data());
+    }
+    return out;
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_detokenizeText(JNIEnv * env, jobject /*unused*/, jintArray jids) {
+    if (!g_model || !jids) {
+        return nullptr;
+    }
+    const jsize n = env->GetArrayLength(jids);
+    jint * ids = env->GetIntArrayElements(jids, nullptr);
+    if (!ids) {
+        return nullptr;
+    }
+    std::vector<llama_token> tokens((size_t) n);
+    for (jsize i = 0; i < n; i++) {
+        tokens[i] = (llama_token) ids[i];
+    }
+    env->ReleaseIntArrayElements(jids, ids, JNI_ABORT);
+
+    const llama_vocab * vocab = llama_model_get_vocab(g_model);
+    // Render specials as their markup: the round trip must reproduce the input verbatim.
+    std::vector<char> buf((size_t) n * 8 + 16);
+    int32_t wrote = llama_detokenize(
+        vocab, tokens.data(), (int32_t) n, buf.data(), (int32_t) buf.size(),
+        /*remove_special*/ false, /*special*/ true);
+    if (wrote < 0) {
+        buf.resize((size_t) (-wrote) + 1);
+        wrote = llama_detokenize(
+            vocab, tokens.data(), (int32_t) n, buf.data(), (int32_t) buf.size(),
+            /*remove_special*/ false, /*special*/ true);
+    }
+    if (wrote < 0) {
+        LOGe("%s: llama_detokenize failed with %d", __func__, wrote);
+        return nullptr;
+    }
+    return env->NewStringUTF(buf.data());
+}
+
 extern "C"
 JNIEXPORT void JNICALL
 Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_unload(JNIEnv * /*unused*/, jobject /*unused*/) {

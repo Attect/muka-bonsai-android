@@ -6,6 +6,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -32,6 +33,7 @@ private val navItems = listOf(
     NavItem(Screen.Chat, "聊天", Icons.AutoMirrored.Filled.Chat),
     NavItem(Screen.Models, "模型", Icons.Default.Download),
     NavItem(Screen.Settings, "设置", Icons.Default.Settings),
+    NavItem(Screen.Vocab, "词表", Icons.Default.TextFields),
 )
 
 @Composable
@@ -79,6 +81,10 @@ fun MainScreen(viewModel: ChatViewModel = viewModel()) {
                 modifier = Modifier.padding(padding)
             )
             Screen.Settings -> SettingsPage(
+                viewModel = viewModel,
+                modifier = Modifier.padding(padding)
+            )
+            Screen.Vocab -> VocabPage(
                 viewModel = viewModel,
                 modifier = Modifier.padding(padding)
             )

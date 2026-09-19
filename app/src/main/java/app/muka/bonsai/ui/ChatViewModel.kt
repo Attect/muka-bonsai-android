@@ -12,6 +12,8 @@ import app.muka.bonsai.llama.InferenceEngine
 import app.muka.bonsai.llama.InferenceParams
 import app.muka.bonsai.llama.KvCacheType
 import app.muka.bonsai.llama.SamplingParams
+import app.muka.bonsai.llama.gguf.FileType
+import app.muka.bonsai.llama.gguf.GgufMetadata
 import app.muka.bonsai.api.OpenAiServer
 import app.muka.bonsai.model.AVAILABLE_MODELS
 import app.muka.bonsai.model.BonsaiModel
@@ -21,6 +23,7 @@ import app.muka.bonsai.model.GgufKind
 import app.muka.bonsai.model.ModelManager
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -78,9 +81,19 @@ data class AppUiState(
     /** Whether API requests auto-load the model named in their "model" field. */
     val apiAutoSwitchModel: Boolean = true,
     val downloadSource: DownloadSource = DownloadSource.Default,
+
+    /** Vocabulary analysis page: text to count plus the in-memory display filter. */
+    val vocabInput: VocabInput = VocabInput(),
+    /** Last analysis outcome, or null if none has completed. */
+    val vocabAnalysis: VocabAnalysis? = null,
+    val vocabAnalyzing: Boolean = false,
+    /** Model file name [vocabAnalysis] was produced with. */
+    val vocabSource: String? = null,
+    /** Analysis failure; kept off [errorMessage] so it does not fire the global snackbar. */
+    val vocabError: String? = null,
 )
 
-enum class Screen { Chat, Models, Settings, Test, About, Licenses }
+enum class Screen { Chat, Models, Settings, Vocab, Test, About, Licenses }
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -161,6 +174,61 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ------------------------------------------------------------------
+    // Vocabulary analysis
+    // ------------------------------------------------------------------
+
+    private var vocabJob: Job? = null
+
+    /** Push a copied input holder (text + display filter) from the page. */
+    fun setVocabInput(input: VocabInput) {
+        _uiState.update { it.copy(vocabInput = input) }
+    }
+
+    /**
+     * Count how the loaded model fragments [AppUiState.vocabInput], and whether the
+     * tokens can be reassembled into the original text. Supersedes a run still in flight.
+     */
+    fun analyzeVocabulary() {
+        val text = _uiState.value.vocabInput.text
+        if (text.isEmpty()) return
+        vocabJob?.cancel()
+        _uiState.update { it.copy(vocabAnalyzing = true, vocabError = null) }
+        vocabJob = viewModelScope.launch(Dispatchers.Default) {
+            try {
+                val ids = engine.tokenize(text)
+                    ?: throw IllegalStateException("请先加载模型，再分析输入文本的分词频次")
+                val counts = LinkedHashMap<Int, Int>()
+                for (id in ids) counts[id] = (counts[id] ?: 0) + 1
+                val freqs = counts.map { (id, count) ->
+                    VocabFreq(id = id, count = count, text = engine.detokenize(intArrayOf(id)) ?: "?")
+                }.sortedWith(compareByDescending<VocabFreq> { it.count }.thenBy { it.id })
+                val restored = engine.detokenize(ids)
+                _uiState.update {
+                    it.copy(
+                        vocabAnalyzing = false,
+                        vocabSource = currentProfileFileName(),
+                        vocabAnalysis = VocabAnalysis(
+                            charCount = text.length,
+                            tokenCount = ids.size,
+                            uniqueCount = counts.size,
+                            restoredOk = restored == text,
+                            restored = restored,
+                            freqs = freqs,
+                        ),
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Vocabulary analysis failed", e)
+                _uiState.update {
+                    it.copy(vocabAnalyzing = false, vocabAnalysis = null, vocabError = e.message ?: "分词分析失败")
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Per-model settings profiles, keyed by model file name
     // ------------------------------------------------------------------
 
@@ -180,8 +248,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun loadProfile(fileName: String): InferenceParams {
-        val json = prefs.getString(KEY_PROFILE_PREFIX + fileName, null) ?: return defaultParams
+    /**
+     * Params for [fileName]. A saved profile always wins. Without one, the app
+     * defaults are merged with the model's own `general.sampling.*` presets, so a
+     * model's very first load uses the sampling its author recommended.
+     */
+    private fun loadProfile(
+        fileName: String,
+        presets: GgufMetadata.SamplingInfo? = null,
+    ): InferenceParams {
+        val json = prefs.getString(KEY_PROFILE_PREFIX + fileName, null) ?: return defaultParams.let { base ->
+            if (presets == null) base else base.copy(
+                sampling = base.sampling.copy(
+                    temperature = presets.temp ?: base.sampling.temperature,
+                    topK = presets.topK ?: base.sampling.topK,
+                    topP = presets.topP ?: base.sampling.topP,
+                )
+            )
+        }
         return try {
             val o = JSONObject(json)
             InferenceParams(
@@ -561,7 +645,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             // Read each model's max context length from its GGUF header (metadata only, fast).
             val contextLengths = mutableMapOf<String, Int>()
             locals.forEach { file ->
-                modelManager.readContextLength(file)?.let { contextLengths[file.absolutePath] = it }
+                modelManager.readMetadata(file)?.dimensions?.contextLength
+                    ?.let { contextLengths[file.absolutePath] = it }
             }
             // Keep in-progress / failed downloads; replace completed ones with fresh scan results.
             val pruned = _uiState.value.downloadStatuses.filterValues {
@@ -758,9 +843,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 is InferenceEngine.State.ModelReady, is InferenceEngine.State.Error -> engine.cleanUp()
                 else -> {}
             }
+            // One header parse feeds the context clamp, the quant guard and the presets.
+            val meta = modelManager.readMetadata(file)
             // Clamp the context size to the model's own maximum (from GGUF metadata).
-            val maxCtx = modelManager.readContextLength(file)
-            var params = loadProfile(file.name)
+            val maxCtx = meta?.dimensions?.contextLength
+            val hasSavedProfile = prefs.contains(KEY_PROFILE_PREFIX + file.name)
+            var params = loadProfile(file.name, meta?.sampling)
             if (maxCtx != null) {
                 _uiState.update {
                     it.copy(modelContextLengths = it.modelContextLengths + (file.absolutePath to maxCtx))
@@ -773,8 +861,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             }
+            if (!hasSavedProfile && meta?.sampling != null) {
+                // Persist the author's presets so the settings page shows what was actually used.
+                saveProfile(file.name, params)
+            }
             // Settings page edits the loaded model's profile from now on.
             _uiState.update { it.copy(params = params) }
+            if (meta?.architecture?.fileType == FileType.MOSTLY_PTQ1_0.code) {
+                throw IllegalStateException(
+                    "暂不支持 PTQ1_0（1.75 bpw）：GPU 内核尚未实现，请下载 PQ2_0 版本")
+            }
             val pairedMmproj = modelManager.mmprojFileFor(file).takeIf { it.exists() }
             if (pairedMmproj != null) {
                 android.util.Log.i(TAG, "Loading multimodally with mmproj ${pairedMmproj.absolutePath}")

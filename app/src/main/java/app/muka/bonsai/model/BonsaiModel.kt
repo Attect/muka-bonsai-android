@@ -57,6 +57,22 @@ data class BonsaiModel(
 
 val AVAILABLE_MODELS = listOf(
     BonsaiModel(
+        family = "Bonsai 2 Ternary 2.13-bit",
+        sizeParam = "27B",
+        repo = "prism-ml/Ternary-Bonsai-2-27B-gguf",
+        filename = "Ternary-Bonsai-2-27B-PQ2_0.gguf",
+        footprintGiB = 7.05,
+        mmprojFilename = "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf",
+        mmprojFootprintGiB = 0.63,
+    ),
+    BonsaiModel(
+        family = "Bonsai 2 Ternary 1.75-bit",
+        sizeParam = "27B",
+        repo = "prism-ml/Ternary-Bonsai-2-27B-gguf",
+        filename = "Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+        footprintGiB = 5.95,
+    ),
+    BonsaiModel(
         family = "Bonsai 1-bit",
         sizeParam = "27B",
         repo = "prism-ml/Bonsai-27B-gguf",
