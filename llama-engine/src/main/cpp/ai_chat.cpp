@@ -97,7 +97,13 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_load(JNIEnv *env, jobjec
         // inside the graph allocator on Adreno 8 Elite in real encoding passes.
         // The text model itself still runs on OpenCL (n_gpu_layers = 99 above).
         mtmd_params.use_gpu = false;
-        mtmd_params.print_timings = false;
+        // Default is 4 threads; the vision tower is a full ViT forward, so it
+        // wants the same core count the text model gets.
+        const long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        if (ncpu > 0) {
+            mtmd_params.n_threads = (int) ncpu;
+        }
+        mtmd_params.print_timings = true;
         g_mtmd = mtmd_init_from_file(mmproj_path, model, mtmd_params);
         env->ReleaseStringUTFChars(jmmproj_path, mmproj_path);
         if (!g_mtmd) {
