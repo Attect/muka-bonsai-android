@@ -59,6 +59,13 @@ interface InferenceEngine {
     fun getLastStopReason(): Int
 
     /**
+     * True when the last turn dropped the earlier turns to reclaim the context
+     * window. Only mrope models need this - their cached positions cannot be
+     * compacted, so a full window can only be freed by starting over.
+     */
+    val historyWasDropped: Boolean
+
+    /**
      * Runs a benchmark with the specified parameters.
      */
     suspend fun bench(pp: Int, tg: Int, pl: Int, nr: Int = 1): String

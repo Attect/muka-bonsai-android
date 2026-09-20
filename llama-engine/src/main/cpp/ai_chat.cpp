@@ -395,6 +395,8 @@ constexpr const char *ROLE_ASSISTANT    = "assistant";
 static std::vector<common_chat_msg> chat_msgs;
 static llama_pos system_prompt_position;
 static llama_pos current_position;
+// Kept so a context overflow can rebuild the cache without another round trip.
+static llama_tokens g_system_tokens;
 
 static void reset_long_term_states(const bool clear_kv_cache = true) {
     chat_msgs.clear();
@@ -508,6 +510,28 @@ static int decode_tokens_in_batches(
     return 0;
 }
 
+// Positions cannot be compacted on mrope models (see shift_context), so once the
+// window is full the only way to keep the conversation going is to start over:
+// clear the cache, replay the system prompt, and let the caller decode whatever
+// triggered the overflow into the fresh window. Earlier turns are dropped, and
+// the caller is expected to tell the user that happened.
+static bool restart_context_and_replay() {
+    if (g_system_tokens.empty()) {
+        LOGe("%s: no saved system prompt to replay", __func__);
+        return false;
+    }
+    reset_long_term_states();
+    reset_short_term_states();
+    if (decode_tokens_in_batches(g_context, g_batch, g_system_tokens, 0) != 0) {
+        LOGe("%s: replaying the system prompt failed", __func__);
+        return false;
+    }
+    system_prompt_position = current_position = (int) g_system_tokens.size();
+    LOGw("%s: context reset, %d system tokens replayed at position 0",
+         __func__, (int) g_system_tokens.size());
+    return true;
+}
+
 extern "C"
 JNIEXPORT jint JNICALL
 Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_processSystemPrompt(
@@ -534,6 +558,7 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_processSystemPrompt(
     // Tokenize system prompt
     const auto system_tokens = common_tokenize(g_context, formatted_system_prompt,
                                                has_chat_template, has_chat_template);
+    g_system_tokens = system_tokens;
     for (auto id: system_tokens) {
         LOGv("token: `%s`\t -> `%d`", common_token_to_piece(g_context, id).c_str(), id);
     }
@@ -596,16 +621,25 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_processUserPrompt(
     }
 
     // Decode user tokens in batches
-    if (decode_tokens_in_batches(g_context, g_batch, user_tokens, current_position, true)) {
-        LOGe("%s: llama_decode() failed!", __func__);
+    int rc = decode_tokens_in_batches(g_context, g_batch, user_tokens, current_position, true);
+    bool history_reset = false;
+    if (rc == 3 && restart_context_and_replay()) {
+        // mrope models cannot compact cached positions, so the window can only be
+        // reclaimed by starting over; retry this message in the fresh window.
+        history_reset = true;
+        rc = decode_tokens_in_batches(g_context, g_batch, user_tokens, current_position, true);
+    }
+    if (rc) {
+        LOGe("%s: llama_decode() failed! (%d)", __func__, rc);
         return 2;
     }
 
-    // Update position
-    current_position += user_prompt_size;
+    // Advance by what was actually fed - user_tokens may have been truncated
+    // above, and a drifted position would misplace every later turn.
+    current_position += (int) user_tokens.size();
     max_new_tokens = n_predict;
     generated_token_count = 0;
-    return 0;
+    return history_reset ? 7 : 0;
 }
 
 /**
@@ -619,7 +653,8 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_processUserPrompt(
  *
  * Return codes: 0 = success, 1 = mtmd not loaded, 2 = marker/bitmap mismatch,
  * 3 = image load failure, 4 = tokenization failure, 5 = prompt too long for
- * the context, 6 = decode failure.
+ * the context, 6 = decode failure, 7 = succeeded after dropping the earlier
+ * turns to reclaim the window.
  */
 extern "C"
 JNIEXPORT jint JNICALL
@@ -712,9 +747,20 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_processUserPromptMtmd(
 
     // Decode the chunks: text via llama_decode, image tiles via the projector.
     llama_pos new_past = current_position;
-    const int32_t res = mtmd_helper_eval_chunks(
+    int32_t res = mtmd_helper_eval_chunks(
             g_mtmd, g_context, chunks.ptr.get(), current_position, /* seq_id */ 0,
             llama_n_batch(g_context), /* logits_last */ true, &new_past);
+    bool history_reset = false;
+    if (res != 0 && restart_context_and_replay()) {
+        // as in the text path: with mrope the window is only reclaimed by
+        // starting over, so this turn's image tiles get encoded a second time
+        LOGw("%s: eval failed (%d), retrying on a fresh context", __func__, res);
+        history_reset = true;
+        new_past = current_position;
+        res = mtmd_helper_eval_chunks(
+                g_mtmd, g_context, chunks.ptr.get(), current_position, /* seq_id */ 0,
+                llama_n_batch(g_context), /* logits_last */ true, &new_past);
+    }
     if (res != 0) {
         LOGe("%s: mtmd_helper_eval_chunks failed with %d", __func__, res);
         return 6;
@@ -723,7 +769,7 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_processUserPromptMtmd(
     current_position = new_past;
     max_new_tokens = n_predict;
     generated_token_count = 0;
-    return 0;
+    return history_reset ? 7 : 0;
 }
 
 static bool is_valid_utf8(const char *string) {

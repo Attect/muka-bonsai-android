@@ -584,11 +584,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     _uiState.update { state ->
                         state.copy(
                             isGenerating = false,
-                            // Surface a length-limit stop, which otherwise looks
-                            // like the model gave up mid-answer.
-                            infoMessage = if (engine.getLastStopReason() == 1)
-                                "已达最大输出长度（${state.params.maxTokens} tokens），可在设置中调大"
-                            else state.infoMessage,
+                            infoMessage = when {
+                                // the model really did forget; say so rather than
+                                // letting it look like a glitch
+                                engine.historyWasDropped ->
+                                    "上下文已满，已丢弃较早轮次并从系统提示重新开始"
+                                // Surface a length-limit stop, which otherwise looks
+                                // like the model gave up mid-answer.
+                                engine.getLastStopReason() == 1 ->
+                                    "已达最大输出长度（${state.params.maxTokens} tokens），可在设置中调大"
+                                else -> state.infoMessage
+                            },
                             metrics = state.metrics.copy(
                                 tokensGenerated = tokenCount,
                                 totalDurationMs = elapsed,

@@ -275,6 +275,7 @@ internal class InferenceEngineImpl private constructor(
             Log.i(TAG, "Sending user prompt...")
             _readyForSystemPrompt = false
             _cancelGeneration = false
+            _historyWasDropped = false
             _state.value = InferenceEngine.State.ProcessingUserPrompt
 
             setSamplingParams(
@@ -304,6 +305,8 @@ internal class InferenceEngineImpl private constructor(
                     0 -> {}
                     1 -> throw IllegalStateException("当前模型未加载 mmproj")
                     5 -> throw IllegalStateException("用户输入超过上下文长度，请缩短消息或增大上下文")
+                    // succeeded, but only because the earlier turns were dropped
+                    7 -> _historyWasDropped = true
                     else -> {
                         Log.e(TAG, "Failed to process user prompt: $it")
                         return@flow
@@ -376,6 +379,10 @@ internal class InferenceEngineImpl private constructor(
     }
 
     override fun getLastStopReason(): Int = getLastStopReasonImpl()
+
+    @Volatile
+    private var _historyWasDropped = false
+    override val historyWasDropped: Boolean get() = _historyWasDropped
 
     /**
      * Unloads the model and frees resources, or reset error states
