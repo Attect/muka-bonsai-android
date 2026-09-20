@@ -73,7 +73,12 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_init(JNIEnv *env, jobjec
 
 extern "C"
 JNIEXPORT jint JNICALL
-Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstring jmodel_path, jstring jmmproj_path) {
+Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_load(
+        JNIEnv *env,
+        jobject,
+        jstring jmodel_path,
+        jstring jmmproj_path,
+        jint jimage_max_tokens) {
     llama_model_params model_params = llama_model_default_params();
     // Offload as many layers as possible to the GPU (OpenCL/Adreno). Ops that
     // the GPU backend cannot run automatically fall back to the CPU.
@@ -138,6 +143,14 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_load(JNIEnv *env, jobjec
         }
         // Prints "image slice encoded in N ms", the only view of this cost.
         mtmd_params.print_timings = true;
+        // Caps how many vision tiles one image may produce: clip converts it to a
+        // pixel budget and resizes before the tower runs, so encode time and the
+        // context the image takes both shrink with it. Non-positive keeps the
+        // projector's own ceiling.
+        if (jimage_max_tokens > 0) {
+            mtmd_params.image_max_tokens = (int) jimage_max_tokens;
+            LOGi("%s: capping one image at %d vision tokens", __func__, (int) jimage_max_tokens);
+        }
         g_mtmd = mtmd_init_from_file(mmproj_path, model, mtmd_params);
         env->ReleaseStringUTFChars(jmmproj_path, mmproj_path);
         if (!g_mtmd) {

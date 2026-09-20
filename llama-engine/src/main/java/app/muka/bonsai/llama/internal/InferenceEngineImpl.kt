@@ -84,7 +84,7 @@ internal class InferenceEngineImpl private constructor(
      */
     private external fun init(nativeLibDir: String)
 
-    private external fun load(modelPath: String, mmprojPath: String): Int
+    private external fun load(modelPath: String, mmprojPath: String, imageMaxTokens: Int): Int
 
     private external fun prepare(nCtx: Int, nThreads: Int, temperature: Float, kvType: Int): Int
 
@@ -193,7 +193,7 @@ internal class InferenceEngineImpl private constructor(
                 Log.i(TAG, "Loading model... \n$pathToModel\nmmproj=$mmprojPath")
                 _readyForSystemPrompt = false
                 _state.value = InferenceEngine.State.LoadingModel
-                load(pathToModel, mmprojPath ?: "").let {
+                load(pathToModel, mmprojPath ?: "", params.imageDetail.maxTokens).let {
                     when (it) {
                         0 -> {}
                         2 -> throw IllegalArgumentException("mmproj 加载失败，请检查文件是否与模型匹配")

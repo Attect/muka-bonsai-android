@@ -9,6 +9,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import app.muka.bonsai.BuildConfig
 import app.muka.bonsai.llama.AiChat
+import app.muka.bonsai.llama.ImageDetail
 import app.muka.bonsai.llama.InferenceEngine
 import app.muka.bonsai.llama.InferenceParams
 import app.muka.bonsai.llama.KvCacheType
@@ -319,6 +320,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         if (saved == KvCacheType.F16 && o.optInt("kvDefaultVersion", 0) < 1)
                             KvCacheType.Q8_0 else saved
                     },
+                imageDetail = (o.optString("imageDetail", "")
+                    .let { name -> ImageDetail.entries.firstOrNull { it.name == name } }
+                    ?: defaultParams.imageDetail),
                 sampling = SamplingParams(
                     temperature = o.optDouble("temperature", defaultParams.sampling.temperature.toDouble()).toFloat(),
                     topK = o.optInt("topK", defaultParams.sampling.topK),
@@ -343,6 +347,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             .put("systemPrompt", params.systemPrompt)
             .put("kvCacheType", params.kvCacheType.name)
             .put("kvDefaultVersion", 1)
+            .put("imageDetail", params.imageDetail.name)
             .put("temperature", params.sampling.temperature.toDouble())
             .put("topK", params.sampling.topK)
             .put("topP", params.sampling.topP.toDouble())

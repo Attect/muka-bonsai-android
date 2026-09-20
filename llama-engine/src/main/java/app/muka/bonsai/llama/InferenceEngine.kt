@@ -148,6 +148,18 @@ enum class KvCacheType(val label: String) {
 }
 
 /**
+ * Resolution budget for one image, in vision tokens. The projector resizes each
+ * picture so its tile count stays within [maxTokens]; both the encode time and
+ * the context the image occupies grow with it. Zero defers to the projector's
+ * own metadata ceiling.
+ */
+enum class ImageDetail(val label: String, val maxTokens: Int) {
+    Low("低 - 256 token（最快，小字会糊）", 256),
+    Medium("中 - 1024 token", 1024),
+    High("高 - 模型上限（最慢）", 0),
+}
+
+/**
  * Sampling parameters for text generation. Applied per-generation (the native
  * sampler is rebuilt for each request), so edits take effect immediately.
  *
@@ -173,6 +185,7 @@ data class InferenceParams(
     val threadCount: Int = Runtime.getRuntime().availableProcessors(),
     val systemPrompt: String = "你是 Bonsai，一位乐于助人的本地设备助手。",
     val kvCacheType: KvCacheType = KvCacheType.Q8_0,
+    val imageDetail: ImageDetail = ImageDetail.Medium,
     val sampling: SamplingParams = SamplingParams(),
 ) {
     companion object {

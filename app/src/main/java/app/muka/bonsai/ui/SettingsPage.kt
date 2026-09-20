@@ -35,6 +35,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import app.muka.bonsai.BuildConfig
+import app.muka.bonsai.llama.ImageDetail
 import app.muka.bonsai.llama.InferenceParams
 import app.muka.bonsai.llama.KvCacheType
 import app.muka.bonsai.model.DownloadSource
@@ -263,6 +264,38 @@ fun SettingsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
             }
             Text(
                 text = "量化可显著减少 KV 缓存内存（Q4 约为 1/4），长上下文收益更大",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        SettingCard(title = "图片细节") {
+            ImageDetail.entries.forEach { detail ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .selectable(
+                            selected = params.imageDetail == detail,
+                            onClick = { viewModel.updateParams(params.copy(imageDetail = detail)) },
+                            enabled = profileTarget != null
+                        ),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    RadioButton(
+                        selected = params.imageDetail == detail,
+                        onClick = { viewModel.updateParams(params.copy(imageDetail = detail)) },
+                        enabled = profileTarget != null
+                    )
+                    Text(
+                        text = detail.label,
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+            }
+            Text(
+                text = "一张图允许的视觉 token 越少，编码越快、占用的上下文也越小。视觉塔在建 mmproj 时定下这个上限，改动后要重新加载模型才生效",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
