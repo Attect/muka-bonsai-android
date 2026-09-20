@@ -121,6 +121,11 @@ fun AboutPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
                 style = MaterialTheme.typography.bodyMedium
             )
             Text(
+                text = "支持 Bonsai 1（Q1_0 / Q2_0 g128）与 Bonsai 2（PQ2_0）的本地推理与多模态输入；"
+                    + "Bonsai 2 的 PTQ1_0 目前只有 CPU 内核，加载时会提示改用 PQ2_0。",
+                style = MaterialTheme.typography.bodyMedium
+            )
+            Text(
                 text = "https://prismml.com/",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.primary,
