@@ -93,14 +93,17 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_load(JNIEnv *env, jobjec
     if (mmproj_path != nullptr && mmproj_path[0] != '\0') {
         LOGi("%s: Loading mmproj from: \n%s\n", __func__, mmproj_path);
         mtmd_context_params mtmd_params = mtmd_context_params_default();
-        // Vision tower stays on the CPU. With use_gpu=true, clip logs "the CLIP
-        // graph uses unsupported operators by the backend", the warmup pass still
-        // succeeds, and then the first real encode dies on a null deref in
-        // ggml_gallocr_alloc_graph <- ggml_backend_sched_alloc_graph <-
-        // clip_image_batch_encode (Adreno 830, reproducible, 2026-09-20). The
-        // sched already carries CPU as a fallback backend, so the suspect is the
-        // CPU/GPU split of whichever op is unsupported, not the backend list.
-        mtmd_params.use_gpu = false;
+        // Per-op breakdown of one 1920x1080 screenshot on the CPU tower: 108.1 s
+        // total, 60.7 s FLASH_ATTN_EXT (27 calls) and 45.0 s MUL_MAT (112 calls).
+        // The tower belongs on the GPU, and what kept it off was flash attention:
+        // this projector's head dim is 72, which the OpenCL backend did not list
+        // as an FA dimension, so clip materialized a [8464, 8464, 16, 1] F32
+        // softmax instead and the graph died in ggml_gallocr_alloc_graph. With
+        // 72x72 added to the FA tables the fused path fits, so ask for it
+        // explicitly - if FA ever becomes unavailable again this fails loudly at
+        // the first encode rather than falling back to the giant softmax.
+        mtmd_params.use_gpu = true;
+        mtmd_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         // Default is 4 threads; the vision tower is a full ViT forward, so it
         // wants the same core count the text model gets.
         const long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
