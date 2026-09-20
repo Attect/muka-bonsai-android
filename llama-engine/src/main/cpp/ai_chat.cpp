@@ -1,7 +1,10 @@
 #include <android/log.h>
 #include <jni.h>
 #include <algorithm>
+#include <cstdlib>
+#include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <cmath>
 #include <string>
 #include <unistd.h>
@@ -78,6 +81,29 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_load(JNIEnv *env, jobjec
 
     const auto *model_path = env->GetStringUTFChars(jmodel_path, 0);
     LOGd("%s: Loading model from: \n%s\n", __func__, model_path);
+
+    // Research hook: an optional fa_tune.txt next to the model overrides the
+    // Adreno flash-attention tile table without a rebuild. Contents are a
+    // GGML_OPENCL_FA_TUNE string, e.g. "256:256:64:32:2:64". Worth sweeping
+    // because prefill measures as 15.2 ms/token plus 3.5e-6*P^2, and that
+    // quadratic term implies an attention throughput the hardware cannot
+    // reach - the shipped 256x256 entry is 16x16 tiles with n_split 16, which
+    // is a decode-shaped config for what is really a prefill GEMM. The backend
+    // reads the variable lazily on the first FA lookup, so this is early enough.
+    {
+        const std::string p(model_path);
+        const std::string tune_file = p.substr(0, p.find_last_of('/') + 1) + "fa_tune.txt";
+        std::ifstream in(tune_file);
+        std::string   tune((std::istreambuf_iterator<char>(in)),
+                            std::istreambuf_iterator<char>());
+        while (!tune.empty() && (tune.back() == '\n' || tune.back() == '\r' || tune.back() == ' ')) {
+            tune.pop_back();
+        }
+        if (!tune.empty()) {
+            setenv("GGML_OPENCL_FA_TUNE", tune.c_str(), 1);
+            LOGi("%s: FA tile override from %s: %s", __func__, tune_file.c_str(), tune.c_str());
+        }
+    }
 
     auto *model = llama_model_load_from_file(model_path, model_params);
     env->ReleaseStringUTFChars(jmodel_path, model_path);
