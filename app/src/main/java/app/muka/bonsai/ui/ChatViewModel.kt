@@ -917,13 +917,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             // Settings page edits the loaded model's profile from now on.
             _uiState.update { it.copy(params = params) }
             if (meta?.architecture?.fileType == FileType.MOSTLY_PTQ1_0.code) {
-                // no GPU kernels yet: the whole model would stay on the CPU, which is far
-                // too slow to be a usable release experience, so release builds refuse it.
+                // The ternary base-3 packing has no tiled GPU GEMM yet: decoding runs
+                // through an untiled kernel at roughly a quarter of PQ2_0's speed and
+                // prompt processing stays on the CPU, so release builds still refuse it.
                 if (!BuildConfig.DEBUG) {
                     throw IllegalStateException(
-                        "暂不支持 PTQ1_0（1.75 bpw）：GPU 内核尚未实现，请下载 PQ2_0 版本")
+                        "PTQ1_0（1.75 bpw）端侧优化未完成：解码约 1.3 tok/s、预填充走 CPU，请下载 PQ2_0 版本")
                 }
-                Log.i(TAG, "PTQ1_0 loaded in a debug build: CPU-only path, for measurement")
+                Log.i(TAG, "PTQ1_0 loaded in a debug build: GPU decode, CPU prefill")
             }
             val pairedMmproj = modelManager.mmprojFileFor(file).takeIf { it.exists() }
             if (pairedMmproj != null) {
