@@ -160,14 +160,21 @@ data class SamplingParams(
  * Runtime parameters for model loading and text generation.
  */
 data class InferenceParams(
-    val contextSize: Int = 8192,
+    val contextSize: Int = MIN_CONTEXT_SIZE,
     val maxTokens: Int = 2048,
     // Default to the number of hardware threads (Snapdragon 8 Elite: 8).
     val threadCount: Int = Runtime.getRuntime().availableProcessors(),
     val systemPrompt: String = "你是 Bonsai，一位乐于助人的本地设备助手。",
     val kvCacheType: KvCacheType = KvCacheType.F16,
     val sampling: SamplingParams = SamplingParams(),
-)
+) {
+    companion object {
+        // Bonsai 2 trains at 262144 and long context is the reason to run it
+        // locally, so this is a floor as well as a default: values persisted by
+        // older builds are raised to it rather than honoured.
+        const val MIN_CONTEXT_SIZE = 32768
+    }
+}
 
 val State.isUninterruptible
     get() = this is State.Initializing ||

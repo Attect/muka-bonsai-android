@@ -118,7 +118,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             ?.let { name -> DownloadSource.entries.firstOrNull { it.name == name } }
             ?: DownloadSource.Default
         defaultParams = InferenceParams(
-            contextSize = prefs.getInt(KEY_CONTEXT_SIZE, InferenceParams().contextSize),
+            contextSize = prefs.getInt(KEY_CONTEXT_SIZE, InferenceParams().contextSize)
+                .coerceAtLeast(InferenceParams.MIN_CONTEXT_SIZE),
             maxTokens = prefs.getInt(KEY_MAX_TOKENS, InferenceParams().maxTokens),
             threadCount = prefs.getInt(KEY_THREAD_COUNT, InferenceParams().threadCount),
             systemPrompt = prefs.getString(KEY_SYSTEM_PROMPT, null) ?: InferenceParams().systemPrompt,
@@ -303,7 +304,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         return try {
             val o = JSONObject(json)
             InferenceParams(
-                contextSize = o.optInt("contextSize", defaultParams.contextSize),
+                contextSize = o.optInt("contextSize", defaultParams.contextSize)
+                    .coerceAtLeast(InferenceParams.MIN_CONTEXT_SIZE),
                 maxTokens = o.optInt("maxTokens", defaultParams.maxTokens),
                 threadCount = o.optInt("threadCount", defaultParams.threadCount),
                 systemPrompt = o.optString("systemPrompt", defaultParams.systemPrompt),

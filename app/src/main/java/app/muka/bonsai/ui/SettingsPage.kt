@@ -208,11 +208,13 @@ fun SettingsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
         SectionHeader("加载参数（重新加载模型后生效）")
 
         SettingCard(title = "上下文长度") {
-            val safeContextSize = params.contextSize.coerceIn(2048, maxContext)
+            // a small-context model must not end up with an inverted range
+            val minContextSize = minOf(InferenceParams.MIN_CONTEXT_SIZE, maxContext)
+            val safeContextSize = params.contextSize.coerceIn(minContextSize, maxContext)
             IntSlider(
                 value = safeContextSize,
                 onValueChange = { viewModel.updateParams(params.copy(contextSize = it)) },
-                range = 2048..maxContext,
+                range = minContextSize..maxContext,
                 step = 2048,
                 label = "$safeContextSize tokens（当前模型上限：$maxContext）",
                 enabled = profileTarget != null
