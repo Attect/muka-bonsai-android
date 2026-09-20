@@ -93,9 +93,13 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_load(JNIEnv *env, jobjec
     if (mmproj_path != nullptr && mmproj_path[0] != '\0') {
         LOGi("%s: Loading mmproj from: \n%s\n", __func__, mmproj_path);
         mtmd_context_params mtmd_params = mtmd_context_params_default();
-        // Image encoding runs on the CPU (clip sched): the OpenCL path crashed
-        // inside the graph allocator on Adreno 8 Elite in real encoding passes.
-        // The text model itself still runs on OpenCL (n_gpu_layers = 99 above).
+        // Vision tower stays on the CPU. With use_gpu=true, clip logs "the CLIP
+        // graph uses unsupported operators by the backend", the warmup pass still
+        // succeeds, and then the first real encode dies on a null deref in
+        // ggml_gallocr_alloc_graph <- ggml_backend_sched_alloc_graph <-
+        // clip_image_batch_encode (Adreno 830, reproducible, 2026-09-20). The
+        // sched already carries CPU as a fallback backend, so the suspect is the
+        // CPU/GPU split of whichever op is unsupported, not the backend list.
         mtmd_params.use_gpu = false;
         // Default is 4 threads; the vision tower is a full ViT forward, so it
         // wants the same core count the text model gets.
@@ -103,6 +107,7 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_load(JNIEnv *env, jobjec
         if (ncpu > 0) {
             mtmd_params.n_threads = (int) ncpu;
         }
+        // Prints "image slice encoded in N ms", the only view of this cost.
         mtmd_params.print_timings = true;
         g_mtmd = mtmd_init_from_file(mmproj_path, model, mtmd_params);
         env->ReleaseStringUTFChars(jmmproj_path, mmproj_path);
