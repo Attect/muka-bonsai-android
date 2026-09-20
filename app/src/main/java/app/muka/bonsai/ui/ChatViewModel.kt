@@ -7,6 +7,7 @@ import android.os.Debug
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import app.muka.bonsai.BuildConfig
 import app.muka.bonsai.llama.AiChat
 import app.muka.bonsai.llama.InferenceEngine
 import app.muka.bonsai.llama.InferenceParams
@@ -916,8 +917,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             // Settings page edits the loaded model's profile from now on.
             _uiState.update { it.copy(params = params) }
             if (meta?.architecture?.fileType == FileType.MOSTLY_PTQ1_0.code) {
-                throw IllegalStateException(
-                    "暂不支持 PTQ1_0（1.75 bpw）：GPU 内核尚未实现，请下载 PQ2_0 版本")
+                // no GPU kernels yet: the whole model would stay on the CPU, which is far
+                // too slow to be a usable release experience, so release builds refuse it.
+                if (!BuildConfig.DEBUG) {
+                    throw IllegalStateException(
+                        "暂不支持 PTQ1_0（1.75 bpw）：GPU 内核尚未实现，请下载 PQ2_0 版本")
+                }
+                Log.i(TAG, "PTQ1_0 loaded in a debug build: CPU-only path, for measurement")
             }
             val pairedMmproj = modelManager.mmprojFileFor(file).takeIf { it.exists() }
             if (pairedMmproj != null) {
