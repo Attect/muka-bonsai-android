@@ -387,13 +387,24 @@ static void reset_long_term_states(const bool clear_kv_cache = true) {
  * - take half of the last (system_prompt_position - system_prompt_position) tokens
  * - recompute the logits in batches
  */
-static void shift_context() {
+static bool shift_context() {
+    const int n_pos_per_embd = llama_model_n_pos_per_embd(g_model);
+    if (n_pos_per_embd > 1) {
+        // llama_kv_cache::seq_add asserts unless there is one position per
+        // embedding, so for mrope models - every multimodal Bonsai among them -
+        // moving cached positions here aborts the process. Refuse and let the
+        // caller surface a failed request instead.
+        LOGe("%s: model has %d positions per embedding, cached positions cannot be"
+             " shifted - refusing to touch the KV cache", __func__, n_pos_per_embd);
+        return false;
+    }
     const int n_discard = (current_position - system_prompt_position) / 2;
     LOGi("%s: Discarding %d tokens", __func__, n_discard);
     llama_memory_seq_rm(llama_get_memory(g_context), 0, system_prompt_position, system_prompt_position + n_discard);
     llama_memory_seq_add(llama_get_memory(g_context), 0, system_prompt_position + n_discard, current_position, -n_discard);
     current_position -= n_discard;
     LOGi("%s: Context shifting done! Current position: %d", __func__, current_position);
+    return true;
 }
 
 static std::string chat_add_and_format(const std::string &role, const std::string &content) {
@@ -447,7 +458,10 @@ static int decode_tokens_in_batches(
         // Shift context if current batch cannot fit into the context
         if (start_pos + i + cur_batch_size >= (int) llama_n_ctx(context) - OVERFLOW_HEADROOM) {
             LOGw("%s: Current batch won't fit into context! Shifting...", __func__);
-            shift_context();
+            if (!shift_context()) {
+                // no code path here may write past the context window
+                return 3;
+            }
         }
 
         // Add tokens to the batch with proper positions
