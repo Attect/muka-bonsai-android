@@ -165,7 +165,7 @@ data class InferenceParams(
     // Default to the number of hardware threads (Snapdragon 8 Elite: 8).
     val threadCount: Int = Runtime.getRuntime().availableProcessors(),
     val systemPrompt: String = "你是 Bonsai，一位乐于助人的本地设备助手。",
-    val kvCacheType: KvCacheType = KvCacheType.F16,
+    val kvCacheType: KvCacheType = KvCacheType.Q8_0,
     val sampling: SamplingParams = SamplingParams(),
 ) {
     companion object {

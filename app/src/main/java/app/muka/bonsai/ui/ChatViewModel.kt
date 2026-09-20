@@ -309,9 +309,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 maxTokens = o.optInt("maxTokens", defaultParams.maxTokens),
                 threadCount = o.optInt("threadCount", defaultParams.threadCount),
                 systemPrompt = o.optString("systemPrompt", defaultParams.systemPrompt),
-                kvCacheType = o.optString("kvCacheType", "")
+                kvCacheType = (o.optString("kvCacheType", "")
                     .let { name -> KvCacheType.entries.firstOrNull { it.name == name } }
-                    ?: defaultParams.kvCacheType,
+                    ?: defaultParams.kvCacheType)
+                    .let { saved ->
+                        // F16 in a pre-versioning profile is the old default, not a
+                        // choice, so it gets upgraded once; an explicit pick is
+                        // re-saved with the current version and left alone.
+                        if (saved == KvCacheType.F16 && o.optInt("kvDefaultVersion", 0) < 1)
+                            KvCacheType.Q8_0 else saved
+                    },
                 sampling = SamplingParams(
                     temperature = o.optDouble("temperature", defaultParams.sampling.temperature.toDouble()).toFloat(),
                     topK = o.optInt("topK", defaultParams.sampling.topK),
@@ -335,6 +342,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             .put("threadCount", params.threadCount)
             .put("systemPrompt", params.systemPrompt)
             .put("kvCacheType", params.kvCacheType.name)
+            .put("kvDefaultVersion", 1)
             .put("temperature", params.sampling.temperature.toDouble())
             .put("topK", params.sampling.topK)
             .put("topP", params.sampling.topP.toDouble())
