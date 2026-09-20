@@ -365,12 +365,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun loadModel(file: File) {
-        viewModelScope.launch {
+        // Off the main thread and behind the same mutex as generation: an API
+        // request that lands mid-load then gets a retryable 429, not a 500.
+        viewModelScope.launch(Dispatchers.IO) {
             if (!file.exists()) {
                 _uiState.update { it.copy(errorMessage = "未找到模型文件：${file.name}") }
                 return@launch
             }
-            performLoad(file)
+            inferenceMutex.withLock { performLoad(file) }
         }
     }
 
@@ -498,27 +500,33 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun reloadModel() {
-        viewModelScope.launch {
-            try {
-                val path = _uiState.value.modelPath
-                    ?: throw IllegalStateException("No model loaded")
-                _uiState.update { it.copy(infoMessage = "正在重新加载模型…") }
-                engine.cleanUp()
-                performLoad(File(path))
-                _uiState.update { it.copy(infoMessage = "模型已重新加载") }
-            } catch (e: Exception) {
-                Log.e(TAG, "Reload failed", e)
-                _uiState.update { it.copy(errorMessage = e.message ?: "重新加载失败") }
+        viewModelScope.launch(Dispatchers.IO) {
+            inferenceMutex.withLock {
+                try {
+                    val path = _uiState.value.modelPath
+                        ?: throw IllegalStateException("No model loaded")
+                    _uiState.update { it.copy(infoMessage = "正在重新加载模型…") }
+                    engine.cleanUp()
+                    performLoad(File(path))
+                    _uiState.update { it.copy(infoMessage = "模型已重新加载") }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Reload failed", e)
+                    _uiState.update { it.copy(errorMessage = e.message ?: "重新加载失败") }
+                }
             }
         }
     }
 
     fun unloadModel() {
-        try {
-            engine.cleanUp()
-            _uiState.update { it.copy(modelPath = null, messages = emptyList(), isMultimodal = false) }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to unload model", e)
+        viewModelScope.launch(Dispatchers.IO) {
+            inferenceMutex.withLock {
+                try {
+                    engine.cleanUp()
+                    _uiState.update { it.copy(modelPath = null, messages = emptyList(), isMultimodal = false) }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to unload model", e)
+                }
+            }
         }
     }
 

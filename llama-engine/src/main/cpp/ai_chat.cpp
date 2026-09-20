@@ -483,13 +483,13 @@ static int decode_tokens_in_batches(
         common_batch_clear(batch);
         LOGv("%s: Preparing a batch size of %d starting at: %d", __func__, cur_batch_size, i);
 
-        // Shift context if current batch cannot fit into the context
+        // Callers pre-check the window: shifting here would rewind the global
+        // current_position while the positions below stay absolute, so every later
+        // batch would land past n_ctx and abort the next llama_decode.
         if (start_pos + i + cur_batch_size >= (int) llama_n_ctx(context) - OVERFLOW_HEADROOM) {
-            LOGw("%s: Current batch won't fit into context! Shifting...", __func__);
-            if (!shift_context()) {
-                // no code path here may write past the context window
-                return 3;
-            }
+            LOGw("%s: batch of %d tokens at position %d does not fit the window",
+                 __func__, cur_batch_size, start_pos + i);
+            return 3;
         }
 
         // Add tokens to the batch with proper positions
@@ -611,18 +611,34 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_processUserPrompt(
         LOGv("token: `%s`\t -> `%d`", common_token_to_piece(g_context, id).c_str(), id);
     }
 
-    // Ensure user prompt doesn't exceed the context size by truncating if necessary.
+    // The prompt has to fit in the window that the history leaves free. Feeding
+    // a truncated remainder used to leave decode_tokens_in_batches shifting the
+    // cache mid-prompt and then writing at stale positions past n_ctx, which
+    // aborts inside the backend scheduler.
     const int user_prompt_size = (int) user_tokens.size();
-    const int max_batch_size = (int) llama_n_ctx(g_context) - OVERFLOW_HEADROOM;
-    if (user_prompt_size > max_batch_size) {
-        const int skipped_tokens = user_prompt_size - max_batch_size;
-        user_tokens.resize(max_batch_size);
-        LOGw("%s: User prompt too long! Skipped %d tokens!", __func__, skipped_tokens);
+    const size_t usable = (size_t) llama_n_ctx(g_context) - OVERFLOW_HEADROOM;
+    bool history_reset = false;
+    if ((size_t) user_prompt_size + current_position > usable) {
+        if ((size_t) user_prompt_size > usable) {
+            LOGe("%s: %d token prompt does not fit an empty %zu position window",
+                 __func__, user_prompt_size, usable);
+            return 5;
+        }
+        // Drop the earlier turns and replay the system prompt. Shifting instead
+        // (seq_rm/seq_add) is not an option here: on this build the fragmented
+        // cache makes the next large decode abort in ggml_backend_sched_split_graph.
+        history_reset = restart_context_and_replay();
+        if (!history_reset || (size_t) user_prompt_size + current_position > usable) {
+            LOGe("%s: %d token prompt still does not fit after reclaiming the window",
+                 __func__, user_prompt_size);
+            return 5;
+        }
+        LOGw("%s: window reclaimed, decoding %d tokens at position %d",
+             __func__, user_prompt_size, current_position);
     }
 
     // Decode user tokens in batches
     int rc = decode_tokens_in_batches(g_context, g_batch, user_tokens, current_position, true);
-    bool history_reset = false;
     if (rc == 3 && restart_context_and_replay()) {
         // mrope models cannot compact cached positions, so the window can only be
         // reclaimed by starting over; retry this message in the fresh window.
@@ -634,9 +650,7 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_processUserPrompt(
         return 2;
     }
 
-    // Advance by what was actually fed - user_tokens may have been truncated
-    // above, and a drifted position would misplace every later turn.
-    current_position += (int) user_tokens.size();
+    current_position += user_prompt_size;
     max_new_tokens = n_predict;
     generated_token_count = 0;
     return history_reset ? 7 : 0;
@@ -739,10 +753,22 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_processUserPromptMtmd(
     LOGi("%s: mtmd prompt: %zu tokens @ position %d (remaining %llu)",
          __func__, n_prompt, current_position,
          (unsigned long long) (current_position < (llama_pos) usable ? usable - current_position : 0));
+    bool history_reset = false;
     if (n_prompt + current_position > usable) {
-        LOGe("%s: mtmd prompt too long for context! %zu tokens, remaining: %zu",
-             __func__, n_prompt, usable > (size_t) current_position ? usable - current_position : 0);
-        return 5;
+        if (n_prompt > usable) {
+            LOGe("%s: mtmd prompt too long for an empty context! %zu tokens, window: %zu",
+                 __func__, n_prompt, usable);
+            return 5;
+        }
+        // The image chunks are fine, only the history is in the way.
+        history_reset = restart_context_and_replay();
+        if (!history_reset || n_prompt + current_position > usable) {
+            LOGe("%s: mtmd prompt too long for context! %zu tokens, remaining: %zu",
+                 __func__, n_prompt, usable > (size_t) current_position ? usable - current_position : 0);
+            return 5;
+        }
+        LOGw("%s: window reclaimed, decoding %zu mtmd tokens at position %d",
+             __func__, n_prompt, current_position);
     }
 
     // Decode the chunks: text via llama_decode, image tiles via the projector.
@@ -750,7 +776,6 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_processUserPromptMtmd(
     int32_t res = mtmd_helper_eval_chunks(
             g_mtmd, g_context, chunks.ptr.get(), current_position, /* seq_id */ 0,
             llama_n_batch(g_context), /* logits_last */ true, &new_past);
-    bool history_reset = false;
     if (res != 0 && restart_context_and_replay()) {
         // as in the text path: with mrope the window is only reclaimed by
         // starting over, so this turn's image tiles get encoded a second time
@@ -815,7 +840,14 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_generateNextToken(
     // Infinite text generation via context shifting
     if (current_position >= (int) llama_n_ctx(g_context) - OVERFLOW_HEADROOM) {
         LOGw("%s: Context full! Shifting...", __func__);
-        shift_context();
+        if (!shift_context()) {
+            // Refused (mrope): decoding at a position past the window aborts the
+            // process, and replaying the system prompt would discard the answer
+            // that is still being generated. End the turn here instead.
+            LOGw("%s: window is full and cannot be compacted, stopping the answer", __func__);
+            last_stop_reason = 2;
+            return nullptr;
+        }
     }
 
     // Stop if reaching the requested generation length. Count-based, so it

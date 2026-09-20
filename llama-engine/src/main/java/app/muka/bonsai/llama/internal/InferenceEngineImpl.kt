@@ -5,6 +5,7 @@ import android.util.Log
 import app.muka.bonsai.llama.InferenceEngine
 import app.muka.bonsai.llama.InferenceParams
 import app.muka.bonsai.llama.KvCacheType
+import app.muka.bonsai.llama.PromptRejectedException
 import app.muka.bonsai.llama.SamplingParams
 import app.muka.bonsai.llama.UnsupportedArchitectureException
 import app.muka.bonsai.llama.internal.InferenceEngineImpl.Companion.getInstance
@@ -294,7 +295,7 @@ internal class InferenceEngineImpl private constructor(
             val useMtmd = _mmprojLoaded || imagePaths.isNotEmpty()
             val result = if (useMtmd) {
                 if (!_mmprojLoaded) {
-                    throw IllegalStateException("当前模型未加载 mmproj，无法处理图片")
+                    throw PromptRejectedException("当前模型未加载 mmproj，无法处理图片")
                 }
                 processUserPromptMtmd(message, imagePaths.toTypedArray(), predictLength)
             } else {
@@ -303,12 +304,15 @@ internal class InferenceEngineImpl private constructor(
             result.let {
                 when (it) {
                     0 -> {}
-                    1 -> throw IllegalStateException("当前模型未加载 mmproj")
-                    5 -> throw IllegalStateException("用户输入超过上下文长度，请缩短消息或增大上下文")
+                    1 -> throw PromptRejectedException("当前模型未加载 mmproj")
+                    5 -> throw PromptRejectedException("用户输入超过上下文长度，请缩短消息或增大上下文")
                     // succeeded, but only because the earlier turns were dropped
                     7 -> _historyWasDropped = true
                     else -> {
                         Log.e(TAG, "Failed to process user prompt: $it")
+                        // Restore the state or the engine stays wedged in
+                        // ProcessingUserPrompt and rejects every later prompt and load.
+                        _state.value = InferenceEngine.State.ModelReady
                         return@flow
                     }
                 }
@@ -329,6 +333,10 @@ internal class InferenceEngineImpl private constructor(
             _state.value = InferenceEngine.State.ModelReady
         } catch (e: CancellationException) {
             Log.i(TAG, "Assistant generation's flow collection cancelled.")
+            _state.value = InferenceEngine.State.ModelReady
+            throw e
+        } catch (e: PromptRejectedException) {
+            Log.i(TAG, "User prompt rejected: ${e.message}")
             _state.value = InferenceEngine.State.ModelReady
             throw e
         } catch (e: Exception) {

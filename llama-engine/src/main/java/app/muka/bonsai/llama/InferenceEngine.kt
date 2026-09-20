@@ -199,3 +199,10 @@ val State.isModelLoaded: Boolean
         this is State.Generating
 
 class UnsupportedArchitectureException : Exception()
+
+/**
+ * The prompt was refused before any of it reached the model (too long for the
+ * context window, or an image on a text-only load), so the engine stays usable.
+ * Callers should report [message] as a client error rather than a server fault.
+ */
+class PromptRejectedException(message: String) : Exception(message)

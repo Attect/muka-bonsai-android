@@ -1,6 +1,7 @@
 package app.muka.bonsai.api
 
 import android.util.Log
+import app.muka.bonsai.llama.PromptRejectedException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -55,6 +56,8 @@ class OpenAiServer(
          * @throws ApiBusyException when another generation is already running
          * @throws NoModelLoadedException when no model is loaded
          * @throws ModelNotFoundException when [model] matches no local model
+         * @throws PromptRejectedException when the engine refuses the prompt content
+         *                                 (e.g. it does not fit the context window)
          */
         suspend fun chatCompletion(
             model: String?,
@@ -75,7 +78,7 @@ class OpenAiServer(
         val finishReason: String,
     )
 
-    class ApiBusyException : Exception("Another generation is in progress")
+    class ApiBusyException : Exception("Another generation or model change is in progress")
     class NoModelLoadedException : Exception("No model is loaded")
     class ModelNotFoundException(requestedId: String) : Exception("Model not found: $requestedId")
 
@@ -262,6 +265,8 @@ class OpenAiServer(
                 writeError(output, 503, e.message)
             } catch (e: ModelNotFoundException) {
                 writeError(output, 404, e.message)
+            } catch (e: PromptRejectedException) {
+                writeError(output, 400, e.message)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -326,6 +331,8 @@ class OpenAiServer(
             if (headersSent) sendErrorEvent(output, e.message) else writeError(output, 503, e.message)
         } catch (e: ModelNotFoundException) {
             if (headersSent) sendErrorEvent(output, e.message) else writeError(output, 404, e.message)
+        } catch (e: PromptRejectedException) {
+            if (headersSent) sendErrorEvent(output, e.message) else writeError(output, 400, e.message)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -379,7 +386,7 @@ class OpenAiServer(
             JSONObject().put(
                 "error", JSONObject()
                     .put("message", message ?: "error")
-                    .put("type", "server_error")
+                    .put("type", if (status == 400) "invalid_request_error" else "server_error")
             )
         )
     }
