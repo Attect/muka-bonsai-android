@@ -228,6 +228,39 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Debug builds only: compare last-position logits for [file] between a CPU-only run
+     * and a fully offloaded one. The check loads the model twice on its own, so the
+     * resident model is released first and has to be loaded again afterwards.
+     */
+    fun runGpuCpuParity(file: File) {
+        viewModelScope.launch {
+            inferenceMutex.withLock {
+                engine.cleanUp()
+                _uiState.update {
+                    it.copy(
+                        modelPath = null,
+                        isMultimodal = false,
+                        infoMessage = "正在比对 CPU 与 GPU（需两次加载，请稍候）…",
+                    )
+                }
+                val report = try {
+                    engine.debugGpuCpuParity(file.absolutePath, "你好，请介绍一下你自己。")
+                } catch (e: Exception) {
+                    Log.e(TAG, "GPU/CPU parity check failed", e)
+                    null
+                }
+                _uiState.update {
+                    when {
+                        report == null -> it.copy(errorMessage = "GPU/CPU 比对未能完成")
+                        report.startsWith("parity_failed") -> it.copy(errorMessage = "GPU/CPU 比对失败：$report")
+                        else -> it.copy(infoMessage = "GPU/CPU 比对 ${file.name}：$report")
+                    }
+                }
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // Per-model settings profiles, keyed by model file name
     // ------------------------------------------------------------------

@@ -426,6 +426,19 @@ fun SettingsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
             ) {
                 Text("Mock 渲染测试")
             }
+
+            val wanted = uiState.modelPath ?: uiState.profileFileName
+            val parityTarget = uiState.localModels.firstOrNull { it.absolutePath == wanted || it.name == wanted }?.absolutePath
+                ?: uiState.localModels.firstOrNull()?.absolutePath
+            Spacer(modifier = Modifier.height(8.dp))
+
+            OutlinedButton(
+                onClick = { parityTarget?.let { viewModel.runGpuCpuParity(java.io.File(it)) } },
+                enabled = parityTarget != null,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("GPU/CPU 数值比对（会先卸载当前模型）")
+            }
         }
     }
 }

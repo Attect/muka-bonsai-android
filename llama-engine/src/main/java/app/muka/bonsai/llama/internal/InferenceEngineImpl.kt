@@ -362,6 +362,11 @@ internal class InferenceEngineImpl private constructor(
     override suspend fun detokenize(tokens: IntArray): String? =
         withContext(llamaDispatcher) { detokenizeText(tokens) }
 
+    override suspend fun debugGpuCpuParity(modelPath: String, prompt: String): String? =
+        withContext(llamaDispatcher) { debugGpuCpuParityNative(modelPath, prompt) }
+
+    private external fun debugGpuCpuParityNative(modelPath: String, prompt: String): String?
+
     /**
      * Cancel an in-progress generation without unloading the model.
      */

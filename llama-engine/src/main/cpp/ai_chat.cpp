@@ -1,5 +1,6 @@
 #include <android/log.h>
 #include <jni.h>
+#include <algorithm>
 #include <iomanip>
 #include <cmath>
 #include <string>
@@ -840,6 +841,105 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_detokenizeText(JNIEnv * 
         return nullptr;
     }
     return env->NewStringUTF(buf.data());
+}
+
+// Debug-only numeric parity check: run one prompt with the model entirely on the CPU and
+// then entirely on the GPU, and compare the last-position logits. Loading the two variants
+// one after the other keeps peak memory at a single copy of the model.
+static bool run_logits_with_offload(
+        const char * path, int n_gpu_layers, const std::string & prompt,
+        std::vector<float> & logits, int32_t & top1, std::string & err) {
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = n_gpu_layers;
+
+    llama_model * model = llama_model_load_from_file(path, mp);
+    if (!model) {
+        err = "load_failed";
+        return false;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+    std::vector<llama_token> tokens(prompt.size() + 16);
+    int32_t n = llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(),
+                               tokens.data(), (int32_t) tokens.size(), /*add_special*/ true,
+                               /*parse_special*/ true);
+    if (n < 0) {
+        tokens.resize(-n);
+        n = llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(),
+                           tokens.data(), (int32_t) tokens.size(), true, true);
+    }
+    if (n <= 0) {
+        llama_model_free(model);
+        err = "tokenize_failed";
+        return false;
+    }
+
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx     = (uint32_t) n + 64;
+    cp.n_batch   = 256;
+    cp.n_threads = 4;
+
+    llama_context * ctx = llama_init_from_model(model, cp);
+    if (!ctx) {
+        llama_model_free(model);
+        err = "ctx_failed";
+        return false;
+    }
+
+    llama_batch batch = llama_batch_get_one(tokens.data(), n);
+    const bool ok = llama_decode(ctx, batch) == 0;
+    const float * lg = ok ? llama_get_logits(ctx) : nullptr;
+    if (lg) {
+        logits.assign(lg, lg + n_vocab);
+        top1 = (int32_t) std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
+    }
+
+    llama_free(ctx);
+    llama_model_free(model);
+
+    if (!lg) {
+        err = "decode_failed";
+        return false;
+    }
+    return true;
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_debugGpuCpuParityNative(
+        JNIEnv * env, jobject /*unused*/, jstring jmodel_path, jstring jprompt) {
+    const char * path = env->GetStringUTFChars(jmodel_path, nullptr);
+    const char * prompt = env->GetStringUTFChars(jprompt, nullptr);
+    const std::string model_path(path), text(prompt);
+    env->ReleaseStringUTFChars(jmodel_path, path);
+    env->ReleaseStringUTFChars(jprompt, prompt);
+
+    std::vector<float> cpu, gpu;
+    int32_t top_cpu = -1, top_gpu = -1;
+    std::string err;
+
+    if (!run_logits_with_offload(model_path.c_str(), 0, text, cpu, top_cpu, err) ||
+        !run_logits_with_offload(model_path.c_str(), 99, text, gpu, top_gpu, err)) {
+        std::string msg = "parity_failed:" + err;
+        return env->NewStringUTF(msg.c_str());
+    }
+
+    double max_abs = 0.0, sum_abs = 0.0;
+    for (size_t i = 0; i < cpu.size(); i++) {
+        const double d = std::fabs((double) cpu[i] - (double) gpu[i]);
+        max_abs = std::max(max_abs, d);
+        sum_abs += d;
+    }
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "n_vocab=%zu max_abs=%.6f mean_abs=%.6f top1_cpu=%d top1_gpu=%d argmax_match=%d",
+        cpu.size(), max_abs, cpu.empty() ? 0.0 : sum_abs / cpu.size(),
+        top_cpu, top_gpu, top_cpu == top_gpu ? 1 : 0);
+    LOGi("%s: %s", __func__, buf);
+    return env->NewStringUTF(buf);
 }
 
 extern "C"

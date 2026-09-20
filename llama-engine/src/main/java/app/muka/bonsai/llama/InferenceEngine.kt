@@ -64,6 +64,14 @@ interface InferenceEngine {
     suspend fun bench(pp: Int, tg: Int, pl: Int, nr: Int = 1): String
 
     /**
+     * Debug-only numeric check: run [prompt] against [modelPath] once with no GPU
+     * offload and once fully offloaded, and compare the last-position logits.
+     * Returns a `key=value` report, or null when the native call could not run.
+     * Each variant is loaded separately, so the engine's own model must be released first.
+     */
+    suspend fun debugGpuCpuParity(modelPath: String, prompt: String): String?
+
+    /**
      * Encode [text] with the loaded model's tokenizer.
      * Returns null when no model is loaded.
      */
