@@ -996,17 +996,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             // Settings page edits the loaded model's profile from now on.
             _uiState.update { it.copy(params = params) }
             if (meta?.architecture?.fileType == FileType.MOSTLY_PTQ1_0.code) {
-                // The ternary base-3 packing has no tiled GPU GEMM yet, and the
-                // OpenCL mul_mat kernel only claims single-token batches - which also
-                // keeps its weights in host memory, because llama probes that
-                // predicate with a 512-column mock when choosing a buffer. Forcing
-                // the weights onto the GPU measured worse (0.97 vs 1.30 tok/s), so
-                // both phases run on the CPU and release builds refuse the format.
+                // The ternary base-3 packing has an OpenCL tiled GEMM now, which is
+                // about 4x faster than the CPU on prompt processing, but decoding
+                // still goes through the gemv and measures slower than the CPU
+                // (0.97 against 1.29 tok/s). A turn of this length mix is a net loss,
+                // so release builds keep refusing the format until the gemv reads a
+                // dedicated struct-of-arrays instead of the interleaved blocks.
                 if (!BuildConfig.DEBUG) {
                     throw IllegalStateException(
-                        "PTQ1_0（1.75 bpw）端侧优化未完成：解码约 1.3 tok/s、预填充约 1.4 t/s，均在 CPU，请下载 PQ2_0 版本")
+                        "PTQ1_0（1.75 bpw）端侧优化未完成：解码约 1 tok/s，请下载 PQ2_0 版本")
                 }
-                Log.i(TAG, "PTQ1_0 loaded in a debug build: CPU decode and prefill")
+                Log.i(TAG, "PTQ1_0 loaded in a debug build: GPU prefill, gemv decode still behind CPU")
             }
             val pairedMmproj = modelManager.mmprojFileFor(file).takeIf { it.exists() }
             if (pairedMmproj != null) {

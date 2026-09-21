@@ -6,7 +6,7 @@
 
 ## 功能特性
 
-- **本地推理**：基于 llama.cpp，支持 Bonsai 1-bit 27B（Q1_0）、Ternary 1.58-bit 27B（Q2_0 g128），以及 **Bonsai 2 27B**：PQ2_0（2.13 bpw，OpenCL GPU 加速）与 PTQ1_0（1.75 bpw，目前解码与预填充都在 CPU，约 1.3 tok/s，明显慢于 PQ2_0）
+- **本地推理**：基于 llama.cpp，支持 Bonsai 1-bit 27B（Q1_0）、Ternary 1.58-bit 27B（Q2_0 g128），以及 **Bonsai 2 27B**：PQ2_0（2.13 bpw，OpenCL GPU 加速）与 PTQ1_0（1.75 bpw，OpenCL tiled GEMM 下预填充比 CPU 快 4.2 倍，但解码仍慢于 CPU，整体明显落后 PQ2_0）
 - **权重折叠旋转**：Bonsai 2 权重以旋转基存储（`prism.hadamard.*`），运行时对激活做 Hadamard 变换还原，GPU 侧用 butterfly 内核完成，不读取显式旋转矩阵
 - **流式渲染**：Markdown（GFM 表格/删除线）、LaTeX 公式（MathJax）、Mermaid 流程图边生成边渲染
 - **思考气泡**：模型 think 内容独立折叠区块，思考过程可展开查看
@@ -49,7 +49,7 @@ llama-engine/    推理引擎模块（JNI 封装、协程流式 API、GGUF 元�
 
 - `block_q2_0` 块大小 64 → 128（PrismML 三值格式，34 字节/块），CPU 点积按 `QK2_0/QK8_0` 泛化
 - 新增 Q2_0 OpenCL kernel（mul_mv / mul_mm / gemv / gemm）
-- Bonsai 2 量化类型：`PQ2_0`（与 `block_q2_0` 逐字节同构，OpenCL 复用同一批内核）与 `PTQ1_0`（28 字节/块的三值 trit 编码；base-3 打包无法原地拆成 q1_0/q2_0 的 SoA，128 个 trit 需要 32 字节而块内只有 26 字节，因此另写了 AoS 的 `mul_mv_ptq1_0_f32`）。该内核目前**跑不到**：它只认领单 token 的 batch，而 llama 决定权重放哪个 buffer 时是用 512 列的 mock 去问同一个判据的，于是权重全留在 host 内存。把限制去掉后实测反而更慢（GPU 0.97 tok/s vs CPU 1.30），所以 PTQ1_0 现在两个阶段都在 CPU；要真正吃到 GPU 需要的是 tiled GEMM
+- Bonsai 2 量化类型：`PQ2_0`（与 `block_q2_0` 逐字节同构，OpenCL 复用同一批内核）与 `PTQ1_0`（28 字节/块的三值 trit 编码）。PTQ1_0 无法原地拆成 q1_0/q2_0 那种 SoA（128 个 trit 按 2 bit 存需要 32 字节，块内去掉缩放只剩 26 字节），所以两个内核都直接读存储的块：`mul_mv_ptq1_0_f32`（gemv，按 trit run 整段处理）与 `mul_mm_ptq1_0_f32_l4_lm`（tiled GEMM，BM=BN=64、BK=32，把一段 K 反量化进局部内存供 64 列共享）。判据从 32 列起认领 batch，这一步同时才让权重真正落到设备上——llama 选择权重 buffer 时用的 mock 就是 512 列。实测（Adreno 830）：预填充 6.12 t/s 对 CPU 的 1.45（4.2 倍），同一提示下 GPU 与 CPU 贪心输出逐字一致；解码仍走 gemv，0.97 tok/s 对 CPU 的 1.29，因为 gemv 每 lane 只吃 16 字节交错块、拿不到 q2_0 SoA 那种连续读法（消融显示 trit 算术只占 16%，剩下是访存形态）。下一步是给 PTQ1_0 做专用 SoA（26 字节量化数组 + 稠密缩放数组，总量不变）
 - `prism.hadamard.*` 权重折叠运行时：解析元数据、materialize 旋转/符号表、在激活侧施加 `x' = H(s*x)`（查表侧施加逆变换），并在调度前校验计算图——若某个折叠权重缺少配套的激活变换则直接报错，而不是静默输出乱码
 - OpenCL 侧以 butterfly FWHT 内核完成该变换（`rot` 即归一化 Sylvester-Walsh 矩阵），避免每 token 读取 1024×1024 稠密矩阵
 
