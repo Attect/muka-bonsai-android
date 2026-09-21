@@ -122,7 +122,7 @@ fun AboutPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
             )
             Text(
                 text = "支持 Bonsai 1（Q1_0 / Q2_0 g128）与 Bonsai 2（PQ2_0）的本地推理与多模态输入；"
-                    + "Bonsai 2 的 PTQ1_0 已可在 GPU 上解码，但速度远低于 PQ2_0，仍建议下载 PQ2_0。",
+                    + "Bonsai 2 的 PTQ1_0 目前解码与预填充都只能在 CPU 上跑（约 1.3 tok/s），请下载 PQ2_0。",
                 style = MaterialTheme.typography.bodyMedium
             )
             Text(
