@@ -1000,8 +1000,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 // about 4x faster than the CPU on prompt processing, but decoding
                 // still goes through the gemv and measures slower than the CPU
                 // (0.97 against 1.29 tok/s). A turn of this length mix is a net loss,
-                // so release builds keep refusing the format until the gemv reads a
-                // dedicated struct-of-arrays instead of the interleaved blocks.
+                // so release builds keep refusing the format. The gemv streams at
+                // ~5 GiB/s where the q2_0 one holds ~33, and bisecting it ruled out
+                // the obvious suspects: the trit math is worth ~16% and the y
+                // footprint ~7%, and an SoA split would read no differently here.
                 if (!BuildConfig.DEBUG) {
                     throw IllegalStateException(
                         "PTQ1_0（1.75 bpw）端侧优化未完成：解码约 1 tok/s，请下载 PQ2_0 版本")

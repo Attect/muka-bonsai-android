@@ -49,7 +49,7 @@ llama-engine/    推理引擎模块（JNI 封装、协程流式 API、GGUF 元�
 
 - `block_q2_0` 块大小 64 → 128（PrismML 三值格式，34 字节/块），CPU 点积按 `QK2_0/QK8_0` 泛化
 - 新增 Q2_0 OpenCL kernel（mul_mv / mul_mm / gemv / gemm）
-- Bonsai 2 量化类型：`PQ2_0`（与 `block_q2_0` 逐字节同构，OpenCL 复用同一批内核）与 `PTQ1_0`（28 字节/块的三值 trit 编码）。PTQ1_0 无法原地拆成 q1_0/q2_0 那种 SoA（128 个 trit 按 2 bit 存需要 32 字节，块内去掉缩放只剩 26 字节），所以两个内核都直接读存储的块：`mul_mv_ptq1_0_f32`（gemv，按 trit run 整段处理）与 `mul_mm_ptq1_0_f32_l4_lm`（tiled GEMM，BM=BN=64、BK=32，把一段 K 反量化进局部内存供 64 列共享）。判据从 32 列起认领 batch，这一步同时才让权重真正落到设备上——llama 选择权重 buffer 时用的 mock 就是 512 列。实测（Adreno 830）：预填充 6.12 t/s 对 CPU 的 1.45（4.2 倍），同一提示下 GPU 与 CPU 贪心输出逐字一致；解码仍走 gemv，0.97 tok/s 对 CPU 的 1.29，因为 gemv 每 lane 只吃 16 字节交错块、拿不到 q2_0 SoA 那种连续读法（消融显示 trit 算术只占 16%，剩下是访存形态）。下一步是给 PTQ1_0 做专用 SoA（26 字节量化数组 + 稠密缩放数组，总量不变）
+- Bonsai 2 量化类型：`PQ2_0`（与 `block_q2_0` 逐字节同构，OpenCL 复用同一批内核）与 `PTQ1_0`（28 字节/块的三值 trit 编码）。PTQ1_0 无法原地拆成 q1_0/q2_0 那种 SoA（128 个 trit 按 2 bit 存需要 32 字节，块内去掉缩放只剩 26 字节），所以两个内核都直接读存储的块：`mul_mv_ptq1_0_f32`（gemv，按 trit run 整段处理）与 `mul_mm_ptq1_0_f32_l4_lm`（tiled GEMM，BM=BN=64、BK=32，把一段 K 反量化进局部内存供 64 列共享）。判据从 32 列起认领 batch，这一步同时才让权重真正落到设备上——llama 选择权重 buffer 时用的 mock 就是 512 列。实测（Adreno 830）：预填充 6.12 t/s 对 CPU 的 1.45（4.2 倍），同一提示下 GPU 与 CPU 贪心输出逐字一致；解码仍走 gemv，0.97 tok/s 对 CPU 的 1.29 —— 但 gemv 只以约 5.1 GiB/s 流权重，而 q2_0 的 gemv 能到 33 GiB/s。二分下来：把 trit 算术换成掩码只值 16%，把 y 全部钉在同一块（L1 命中）只值 6.6%，而 AoS 与 SoA 在这个内核里的读取形态本来就等价（每 lane 都是 1 次 4 字节装载覆盖 4 个权重），所以拆 SoA 并不能补上这 5 倍，剩下的是什么还没查清
 - `prism.hadamard.*` 权重折叠运行时：解析元数据、materialize 旋转/符号表、在激活侧施加 `x' = H(s*x)`（查表侧施加逆变换），并在调度前校验计算图——若某个折叠权重缺少配套的激活变换则直接报错，而不是静默输出乱码
 - OpenCL 侧以 butterfly FWHT 内核完成该变换（`rot` 即归一化 Sylvester-Walsh 矩阵），避免每 token 读取 1024×1024 稠密矩阵
 
