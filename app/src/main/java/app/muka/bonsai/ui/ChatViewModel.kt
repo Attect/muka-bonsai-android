@@ -264,6 +264,33 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Debug-only llama-bench style measurement of the loaded model: prompt
+     * processing and single-token generation speed. This is how decode gets
+     * attributed between the CPU and the GPU path (see gpu_layers.txt).
+     */
+    fun runBench(pp: Int = 512, tg: Int = 128) {
+        viewModelScope.launch {
+            inferenceMutex.withLock {
+                if (engine.state.value !is InferenceEngine.State.ModelReady) {
+                    _uiState.update { it.copy(errorMessage = "请先加载模型，再跑基准测试") }
+                    return@withLock
+                }
+                _uiState.update { it.copy(infoMessage = "正在跑基准测试 pp=$pp / tg=$tg ...") }
+                val report = try {
+                    engine.bench(pp, tg, 1)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Bench failed", e)
+                    null
+                }
+                Log.i(TAG, "Bench report:\n$report")
+                _uiState.update {
+                    it.copy(infoMessage = report?.let { r -> "基准测试\n$r" } ?: "基准测试失败")
+                }
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // Per-model settings profiles, keyed by model file name
     // ------------------------------------------------------------------
@@ -701,46 +728,49 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refreshLocalModels() {
-        viewModelScope.launch {
-            // Pick up downloads that completed while the app was not running.
-            modelManager.sweepStagingDownloads()
-            val locals = modelManager.scanLocalModels()
-            val mmprojs = modelManager.scanLocalMmproj()
-            val statuses = mutableMapOf<String, DownloadStatus>()
-            val missingMmproj = mutableSetOf<String>()
-            AVAILABLE_MODELS.forEach { model ->
-                val file = modelManager.modelFile(model)
-                val exists = file.exists()
-                android.util.Log.i(TAG, "Model ${model.id}: path=${file.absolutePath}, exists=$exists")
-                if (exists) {
-                    if (model.mmprojFilename != null && !modelManager.hasMmproj(model)) {
-                        missingMmproj += model.id
-                    } else {
-                        statuses[model.id] = DownloadStatus.Downloaded(file)
-                    }
+        viewModelScope.launch { refreshLocalModelsNow() }
+    }
+
+    /** [refreshLocalModels] as an awaitable call, for paths that need the result. */
+    private suspend fun refreshLocalModelsNow() {
+        // Pick up downloads that completed while the app was not running.
+        modelManager.sweepStagingDownloads()
+        val locals = modelManager.scanLocalModels()
+        val mmprojs = modelManager.scanLocalMmproj()
+        val statuses = mutableMapOf<String, DownloadStatus>()
+        val missingMmproj = mutableSetOf<String>()
+        AVAILABLE_MODELS.forEach { model ->
+            val file = modelManager.modelFile(model)
+            val exists = file.exists()
+            android.util.Log.i(TAG, "Model ${model.id}: path=${file.absolutePath}, exists=$exists")
+            if (exists) {
+                if (model.mmprojFilename != null && !modelManager.hasMmproj(model)) {
+                    missingMmproj += model.id
+                } else {
+                    statuses[model.id] = DownloadStatus.Downloaded(file)
                 }
             }
-            // Read each model's max context length from its GGUF header (metadata only, fast).
-            val contextLengths = mutableMapOf<String, Int>()
-            locals.forEach { file ->
-                modelManager.readMetadata(file)?.dimensions?.contextLength
-                    ?.let { contextLengths[file.absolutePath] = it }
-            }
-            // Keep in-progress / failed downloads; replace completed ones with fresh scan results.
-            val pruned = _uiState.value.downloadStatuses.filterValues {
-                it.type == DownloadStatus.Type.Downloading || it.type == DownloadStatus.Type.Failed
-            }
-            _uiState.update {
-                it.copy(
-                    localModels = locals,
-                    mmprojFiles = mmprojs,
-                    downloadStatuses = pruned + statuses,
-                    modelContextLengths = contextLengths,
-                    mmprojMissingIds = missingMmproj,
-                )
-            }
-            android.util.Log.i(TAG, "refreshLocalModels done, models=${locals.map { it.name }}, mmprojs=${mmprojs.map { it.name }}, missingMmproj=$missingMmproj")
         }
+        // Read each model's max context length from its GGUF header (metadata only, fast).
+        val contextLengths = mutableMapOf<String, Int>()
+        locals.forEach { file ->
+            modelManager.readMetadata(file)?.dimensions?.contextLength
+                ?.let { contextLengths[file.absolutePath] = it }
+        }
+        // Keep in-progress / failed downloads; replace completed ones with fresh scan results.
+        val pruned = _uiState.value.downloadStatuses.filterValues {
+            it.type == DownloadStatus.Type.Downloading || it.type == DownloadStatus.Type.Failed
+        }
+        _uiState.update {
+            it.copy(
+                localModels = locals,
+                mmprojFiles = mmprojs,
+                downloadStatuses = pruned + statuses,
+                modelContextLengths = contextLengths,
+                mmprojMissingIds = missingMmproj,
+            )
+        }
+        android.util.Log.i(TAG, "refreshLocalModels done, models=${locals.map { it.name }}, mmprojs=${mmprojs.map { it.name }}, missingMmproj=$missingMmproj")
     }
 
     private fun autoLoadSingleModel() {
@@ -893,6 +923,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
         val current = _uiState.value.modelPath?.let { File(it) }
         if (current != null && current.matches(requested)) return
+        // The startup scan fills the list asynchronously; without this a request
+        // that lands before it finishes gets "model not found" for a file that is
+        // sitting right there on disk.
+        if (_uiState.value.localModels.isEmpty()) refreshLocalModelsNow()
         val target = _uiState.value.localModels.firstOrNull { it.matches(requested) }
             ?: throw OpenAiServer.ModelNotFoundException(requested)
         performLoad(target)
@@ -911,6 +945,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 else -> "User: $content"
             }
         }
+    }
+
+    /**
+     * Debug-only: a `bench.txt` next to the model, holding "pp,tg", runs a
+     * benchmark as soon as that model finishes loading. Sweeping gpu_layers.txt
+     * needs a fresh load per point, and this turns each point into one file push
+     * plus one API request instead of a settings-page tap.
+     */
+    private fun readBenchSpec(model: File): Pair<Int, Int>? {
+        if (!BuildConfig.DEBUG) return null
+        val parts = runCatching {
+            File(model.parentFile, "bench.txt").readText().trim().split(",")
+        }.getOrNull() ?: return null
+        val pp = parts.getOrNull(0)?.trim()?.toIntOrNull() ?: return null
+        val tg = parts.getOrNull(1)?.trim()?.toIntOrNull() ?: return null
+        return pp to tg
     }
 
     private suspend fun performLoad(file: File) {
@@ -971,6 +1021,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     infoMessage = if (engine.isMultimodal) "模型就绪（多模态）" else "模型就绪",
                     isMultimodal = engine.isMultimodal,
                 )
+            }
+            readBenchSpec(file)?.let { (pp, tg) ->
+                Log.i(TAG, "bench.txt: queueing pp=$pp tg=$tg for ${file.name}")
+                runBench(pp, tg)
             }
         } catch (e: CancellationException) {
             throw e

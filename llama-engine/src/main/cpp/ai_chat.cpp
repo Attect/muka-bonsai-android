@@ -110,6 +110,22 @@ Java_app_muka_bonsai_llama_internal_InferenceEngineImpl_load(
         }
     }
 
+    // Research hook: an optional gpu_layers.txt next to the model overrides how
+    // many layers are offloaded. Offload is decided once, at model load, so this
+    // is the only way to sweep it on device - needed to attribute decode
+    // throughput between the CPU and the Adreno path. A negative value means
+    // "as many as possible" (the shipped default).
+    {
+        const std::string p(model_path);
+        const std::string layers_file = p.substr(0, p.find_last_of('/') + 1) + "gpu_layers.txt";
+        std::ifstream in(layers_file);
+        int layers = 0;
+        if (in >> layers) {
+            model_params.n_gpu_layers = layers < 0 ? 99 : layers;
+            LOGi("%s: n_gpu_layers override from %s: %d", __func__, layers_file.c_str(), layers);
+        }
+    }
+
     auto *model = llama_model_load_from_file(model_path, model_params);
     env->ReleaseStringUTFChars(jmodel_path, model_path);
     if (!model) {

@@ -474,6 +474,16 @@ fun SettingsPage(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
             ) {
                 Text("GPU/CPU 数值比对（会先卸载当前模型）")
             }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            OutlinedButton(
+                onClick = { viewModel.runBench() },
+                enabled = uiState.modelPath != null,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("基准测试 pp512/tg128（用已加载模型）")
+            }
         }
     }
 }
